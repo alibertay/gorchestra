@@ -423,9 +423,3 @@ Go 1.23+ (see `go.mod`).
 - Go **1.23+** (toolchain 1.24 supported)
 - Optional: `github.com/prometheus/client_golang` if you enable metrics/server
 - Optional: `go.uber.org/goleak` for tests
-
----
-
-## License
-
-MIT (or your preferred OSS license). Replace this section if you ship a different one.
