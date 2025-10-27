@@ -1,0 +1,121 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>gorchestra dashboard</title>
+<style>
+body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; color:#111; background:#fff;}
+h1 { font-size: 20px; margin: 0 0 8px; }
+small { color:#666 }
+table { border-collapse: collapse; width:100%; margin:10px 0 24px; }
+th, td { border-bottom:1px solid #eee; padding:6px 8px; text-align:left; font-size:13px; }
+.badge { padding:2px 6px; border-radius:4px; background:#eef; }
+.ok { background:#e6ffe6 }
+.stop { background:#ffe6e6 }
+.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;}
+.grid { display:grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.card { border:1px solid #eee; border-radius:10px; padding:12px; box-shadow: 0 1px 3px rgba(0,0,0,.04);}
+.spark { width:160px; height:32px; }
+.footer { color:#777; font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+  <h1>gorchestra</h1>
+  <div class="grid">
+    <div class="card">
+      <div><b>Process CPU</b> <small id="cpuPct">…</small></div>
+      <canvas id="cpuSpark" class="spark"></canvas>
+      <div class="footer"><small>Prometheus: <code class="code">gorchestra_process_cpu_percent</code> • <a href="/metrics">/metrics</a></small></div>
+    </div>
+    <div class="card">
+      <div><b>Endpoints</b></div>
+      <div class="code">
+        <div>• /metrics (Prometheus)</div>
+        <div>• /debug/pprof (profiling)</div>
+        <div>• /gorchestra (this dashboard)</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <b>Routines</b>
+    <table id="tblR"><tr><th>ID</th><th>Name</th><th>State</th><th>Health</th><th>Restarts</th><th>Queue</th></tr></table>
+  </div>
+
+  <div class="card">
+    <b>Topics</b>
+    <table id="tblT"><tr><th>Name</th><th>Len/Cap</th><th>Bytes</th></tr></table>
+  </div>
+
+<script>
+const cpuHist = [];
+const MAX = 60;
+const safe = v => (v === undefined || v === null || v === "") ? "-" : v;
+
+function drawSpark(id, arr){
+  const c = document.getElementById(id);
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+  if(arr.length<2) return;
+  const w=c.width,h=c.height,max=100,min=0;
+  ctx.beginPath();
+  for(let i=0;i<arr.length;i++){
+    const x = i/(arr.length-1)*w;
+    const y = h - (arr[i]-min)/(max-min)*h;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+}
+
+async function tick(){
+  // CPU gauge from /metrics
+  try{
+    const m = await fetch('/metrics').then(r=>r.text());
+    const line = m.split('\n').find(x=>x.startsWith('gorchestra_process_cpu_percent '));
+    if(line){
+      const v = parseFloat(line.split(' ')[1]);
+      cpuHist.push(v); if(cpuHist.length>MAX) cpuHist.shift();
+      document.getElementById('cpuPct').innerText = `~ ${v.toFixed(1)}%`;
+      drawSpark('cpuSpark', cpuHist);
+    }
+  }catch{}
+
+  // Routines
+  try{
+    const r = await fetch('/gorchestra/snapshots').then(r=>r.json());
+    const rows = ['<tr><th>ID</th><th>Name</th><th>State</th><th>Health</th><th>Restarts</th><th>Queue</th></tr>'];
+    r.forEach(s=>{
+      const id = safe(s.id);
+      const name = safe(s.name);
+      const state = safe(s.state);
+      const health = safe(s.health);
+      const restarts = safe(s.restarts);
+      const qlen = safe(s.queueLen);
+      const cls = state==='RUNNING'?'ok':(state==='STOPPED'?'stop':'');
+      rows.push(
+        `<tr class="${cls}"><td>${id}</td><td>${name}</td><td><span class="badge">${state}</span></td><td>${health}</td><td>${restarts}</td><td>${qlen}</td></tr>`
+      );
+    });
+    document.getElementById('tblR').innerHTML = rows.join('');
+  }catch(e){
+    console.error(e);
+  }
+
+  // Topics
+  try{
+    const t = await fetch('/gorchestra/topics').then(r=>r.json());
+    const rows = ['<tr><th>Name</th><th>Len/Cap</th><th>Bytes</th></tr>'];
+    t.forEach(x=>{
+      rows.push(`<tr><td>${safe(x.name)}</td><td>${safe(x.stat.Len)}/${safe(x.stat.Cap)}</td><td>${safe(x.stat.ApproxBytes)}</td></tr>`);
+    });
+    document.getElementById('tblT').innerHTML = rows.join('');
+  }catch(e){
+    console.error(e);
+  }
+
+  setTimeout(tick, 1000);
+}
+tick();
+</script>
+</body>
+</html>
