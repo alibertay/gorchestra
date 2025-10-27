@@ -58,7 +58,7 @@ Goroutine orchestration & observability toolkit for Go. Manage worker lifecycles
 ## Install
 
 ```bash
-go get github.com/yourusername/gorchestra
+go get github.com/alibertay/gorchestra
 ```
 
 Add Prometheus only if you use metrics or the obs server:
@@ -81,7 +81,7 @@ import (
     "log"
     "time"
 
-    g "github.com/yourusername/gorchestra"
+    g "github.com/alibertay/gorchestra"
 )
 
 func main() {
@@ -165,8 +165,8 @@ _ = r
 ```go
 import (
     "log"
-    obs "github.com/yourusername/gorchestra/obs"
-    g "github.com/yourusername/gorchestra"
+    obs "github.com/alibertay/gorchestra/obs"
+    g "github.com/alibertay/gorchestra"
 )
 
 func main() {
@@ -235,9 +235,9 @@ If you already have your own HTTP stack, you can register the standalone collect
 
 > Package import paths (shortened below):
 >
-> - Core: `github.com/yourusername/gorchestra`
-> - Observability: `github.com/yourusername/gorchestra/obs`
-> - Prometheus collector: `github.com/yourusername/gorchestra/metrics`
+> - Core: `github.com/alibertay/gorchestra`
+> - Observability: `github.com/alibertay/gorchestra/obs`
+> - Prometheus collector: `github.com/alibertay/gorchestra/metrics`
 
 ### Orchestrator API
 
