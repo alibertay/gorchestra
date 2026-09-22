@@ -18,25 +18,27 @@ const (
 type SupervisorOption func(*SupervisorConfig)
 
 type SupervisorConfig struct {
-	Policy     RestartPolicy
-	Initial    time.Duration // backoff start
-	Max        time.Duration // backoff cap
-	Multiplier float64
-	Jitter     float64 // 0..1
-	Name       string
-	Idle       time.Duration
-	QueueCap   int
+	Policy       RestartPolicy
+	Initial      time.Duration // backoff start
+	Max          time.Duration // backoff cap
+	Multiplier   float64
+	Jitter       float64       // 0..1
+	StableWindow time.Duration // attempts that ran this long reset the backoff
+	Name         string
+	Idle         time.Duration
+	QueueCap     int
 }
 
 func defaultSupCfg() SupervisorConfig {
 	return SupervisorConfig{
-		Policy:     RestartOnFailure,
-		Initial:    200 * time.Millisecond,
-		Max:        5 * time.Second,
-		Multiplier: 2.0,
-		Jitter:     0.2,
-		Idle:       5 * time.Second,
-		QueueCap:   128,
+		Policy:       RestartOnFailure,
+		Initial:      200 * time.Millisecond,
+		Max:          5 * time.Second,
+		Multiplier:   2.0,
+		Jitter:       0.2,
+		StableWindow: 30 * time.Second,
+		Idle:         0, // idle timeout disabled unless explicitly enabled
+		QueueCap:     128,
 	}
 }
 
@@ -60,10 +62,78 @@ func WithSupBackoff(initial, max time.Duration, mult float64, jitter float64) Su
 		}
 	}
 }
+
+// WithSupStableWindow resets the backoff to its initial value after an
+// attempt that ran at least d without returning. 0 disables the reset.
+func WithSupStableWindow(d time.Duration) SupervisorOption {
+	return func(c *SupervisorConfig) {
+		if d < 0 {
+			d = 0
+		}
+		c.StableWindow = d
+	}
+}
+
+// WithSupIdleTimeout cancels the supervised routine (like a normal routine)
+// when it stops heartbeating. The supervisor keeps heartbeating while it is
+// waiting out a backoff delay. 0 disables the idle watchdog.
 func WithSupIdleTimeout(d time.Duration) SupervisorOption {
-	return func(c *SupervisorConfig) { c.Idle = d }
+	return func(c *SupervisorConfig) {
+		if d < 0 {
+			d = 0
+		}
+		c.Idle = d
+	}
 }
 func WithSupQueueCap(n int) SupervisorOption { return func(c *SupervisorConfig) { c.QueueCap = n } }
+
+// backoff computes exponential backoff delays with jitter and knows how to
+// reset itself after a stable run.
+type backoff struct {
+	initial time.Duration
+	max     time.Duration
+	mult    float64
+	jitter  float64
+	current time.Duration
+}
+
+func newBackoff(cfg SupervisorConfig) *backoff {
+	return &backoff{
+		initial: cfg.Initial,
+		max:     cfg.Max,
+		mult:    cfg.Multiplier,
+		jitter:  cfg.Jitter,
+		current: cfg.Initial,
+	}
+}
+
+func (b *backoff) reset() { b.current = b.initial }
+
+// next returns the sleep duration for the current step and advances the
+// backoff progression.
+func (b *backoff) next() time.Duration {
+	sleep := b.current
+	if b.jitter > 0 {
+		factor := 1.0 + (b.jitter * (rand.Float64()*2 - 1)) // 1±jitter
+		sleep = time.Duration(float64(sleep) * factor)
+	}
+	if sleep > b.max {
+		sleep = b.max
+	}
+	if sleep < 0 {
+		sleep = 0
+	}
+
+	nextStep := time.Duration(float64(b.current) * b.mult)
+	if nextStep > b.max {
+		nextStep = b.max
+	}
+	if nextStep < b.initial {
+		nextStep = b.initial
+	}
+	b.current = nextStep
+	return sleep
+}
 
 // runAttempt runs a single supervised worker attempt inside its own panic
 // boundary. A panic is converted into an error so the restart policy can
@@ -77,7 +147,42 @@ func runAttempt(fn func(ctx context.Context, self *Routine) error, ctx context.C
 	return fn(ctx, self)
 }
 
-// GoSupervised: fn dönerse policy'e göre yeniden başlatır.
+// waitBackoff waits out a backoff delay while keeping the heartbeat alive, so
+// a supervised routine with an idle timeout is not mistaken for a dead one
+// while it is merely waiting to restart. Returns false if ctx was cancelled.
+func waitBackoff(ctx context.Context, self *Routine, d time.Duration, idle time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	beat := time.Second
+	if idle > 0 && idle/2 < beat {
+		beat = idle / 2
+	}
+	if beat < time.Millisecond {
+		beat = time.Millisecond
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	ticker := time.NewTicker(beat)
+	defer ticker.Stop()
+
+	self.Beat()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			self.Beat()
+		case <-timer.C:
+			return true
+		}
+	}
+}
+
+// GoSupervised runs fn under a restart policy: when an attempt returns (or
+// panics) the supervisor waits out an exponential backoff and starts a new
+// attempt. Attempts that ran at least StableWindow reset the backoff.
 func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) error, opts ...SupervisorOption) *Routine {
 	cfg := defaultSupCfg()
 	for _, opt := range opts {
@@ -85,15 +190,20 @@ func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) 
 	}
 	// tek Routine içinde loop ederek supervise edelim
 	return o.Go(func(ctx context.Context, self *Routine) error {
-		backoff := cfg.Initial
+		bo := newBackoff(cfg)
 		for {
 			// her denemede yeni child-context
+			attemptStart := o.clock.Now()
 			childCtx, cancel := context.WithCancel(ctx)
 			err := runAttempt(fn, childCtx, self)
 			cancel()
 
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+
+			if cfg.StableWindow > 0 && o.clock.Since(attemptStart) >= cfg.StableWindow {
+				bo.reset()
 			}
 
 			restart := false
@@ -112,24 +222,9 @@ func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) 
 
 			self.incrementRestarts()
 
-			// backoff + jitter
-			j := 1.0 + (cfg.Jitter * (rand.Float64()*2 - 1)) // 1±jitter
-			sleep := time.Duration(float64(backoff) * j)
-			if sleep > cfg.Max {
-				sleep = cfg.Max
-			}
-			timer := time.NewTimer(sleep)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
+			if !waitBackoff(ctx, self, bo.next(), cfg.Idle) {
 				return ctx.Err()
-			case <-timer.C:
 			}
-			next := time.Duration(float64(backoff) * cfg.Multiplier)
-			if next > cfg.Max {
-				next = cfg.Max
-			}
-			backoff = next
 		}
 	}, WithName(cfg.Name), WithIdleTimeout(cfg.Idle), WithQueueCap(cfg.QueueCap))
 }
