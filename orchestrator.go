@@ -53,12 +53,18 @@ func WithHistoryLimit(n int) OrchestratorOption {
 	}
 }
 
-// WithTerminalCardinalityLimit bounds how many distinct (name, state)
-// terminal counters are tracked. Once the limit is reached, new
-// combinations are aggregated under OverflowRoutineName; existing
-// combinations keep counting normally. 0 (default) means unlimited.
+// WithTerminalCardinalityLimit limits how many (name, state) terminal
+// counters are tracked individually. Once n combinations exist, any new
+// name is aggregated into a per-state OverflowRoutineName bucket (state is
+// preserved); combinations that are already tracked keep counting
+// normally.
 //
-// Routine names should be low-cardinality labels by contract.
+// The total number of series is therefore not exactly n: it is at most n
+// individually tracked combinations plus one overflow bucket per terminal
+// state that overflows.
+//
+// 0 (the default) means unlimited. Routine names should be low-cardinality
+// labels by contract; set a limit when names can be dynamic.
 func WithTerminalCardinalityLimit(n int) OrchestratorOption {
 	return func(o *Orchestrator) {
 		if n < 0 {

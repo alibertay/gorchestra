@@ -32,8 +32,10 @@ const OverflowRoutineName = "__other__"
 // Contract: routine names are expected to be low-cardinality labels (e.g.
 // "price-feed", "order-worker"), not per-entity identifiers (e.g.
 // "order-918272"). High-cardinality names inflate both memory and Prometheus
-// series; use WithTerminalCardinalityLimit to cap the number of distinct
-// series and bucket the rest under OverflowRoutineName.
+// series; use WithTerminalCardinalityLimit to cap how many (name, state)
+// combinations are tracked individually. Once the limit is reached new
+// names are aggregated into per-state OverflowRoutineName buckets, so the
+// state dimension is always preserved.
 type TerminalCount struct {
 	Name  string
 	State RoutineState

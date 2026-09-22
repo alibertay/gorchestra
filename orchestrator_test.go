@@ -135,6 +135,49 @@ func TestOrchestrator_TerminalCardinalityLimitBucketsOverflow(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_TerminalCardinalityOverflowKeepsStates(t *testing.T) {
+	o := New(WithTerminalCardinalityLimit(1))
+
+	r := o.Go(func(ctx context.Context, self *Routine) error { return nil }, WithName("a"))
+	_ = r.Wait()
+
+	r = o.Go(func(ctx context.Context, self *Routine) error { return nil }, WithName("b"))
+	_ = r.Wait()
+
+	r = o.Go(func(ctx context.Context, self *Routine) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}, WithName("c"), WithIdleTimeout(50*time.Millisecond))
+	if err := r.Wait(); !errors.Is(err, ErrIdleTimeout) {
+		t.Fatalf("expected ErrIdleTimeout, got %v", err)
+	}
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	// "a" is tracked individually; "b" and "c" overflow into per-state
+	// __other__ buckets (STOPPED and TIMED_OUT), so the state dimension is
+	// preserved even for overflowed names.
+	type key struct {
+		name  string
+		state RoutineState
+	}
+	want := map[key]uint64{
+		{"a", StateStopped}:                  1,
+		{OverflowRoutineName, StateStopped}:  1,
+		{OverflowRoutineName, StateTimedOut}: 1,
+	}
+	counts := o.TerminalCounts()
+	if len(counts) != len(want) {
+		t.Fatalf("expected %d terminal series, got %d: %+v", len(want), len(counts), counts)
+	}
+	for _, c := range counts {
+		if want[key{c.Name, c.State}] != c.Count {
+			t.Fatalf("unexpected count for %s/%s: %d", c.Name, c.State, c.Count)
+		}
+	}
+}
+
 func TestOrchestrator_TerminalCardinalityUnlimitedByDefault(t *testing.T) {
 	o := New()
 	for _, name := range []string{"a", "b", "c", "d"} {
