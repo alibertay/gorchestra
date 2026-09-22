@@ -4,7 +4,8 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
-	"fmt"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/pprof"
 	"runtime"
@@ -30,6 +31,11 @@ type Server struct {
 	http  *http.Server
 	stopC chan struct{}
 	wg    sync.WaitGroup
+
+	startOnce sync.Once
+	stopOnce  sync.Once
+	lnMu      sync.Mutex
+	ln        net.Listener
 
 	reg        *prometheus.Registry
 	collector  *gom.Collector
@@ -72,11 +78,13 @@ func NewServer(o *g.Orchestrator, opts ...Option) *Server {
 
 	// Routes
 	s.mux.Handle("/metrics", promhttp.HandlerFor(s.reg, promhttp.HandlerOpts{}))
-	// dashboard (hem /gorchestra hem /gorchestra/ çalışsın)
-	s.mux.HandleFunc("/gorchestra", s.handleDashboard)
-	s.mux.HandleFunc("/gorchestra/", s.handleDashboard)
-	s.mux.HandleFunc("/gorchestra/snapshots", s.handleSnapshotsJSON)
-	s.mux.HandleFunc("/gorchestra/topics", s.handleTopicsJSON)
+	if s.opt.EnableDashboard {
+		// dashboard (hem /gorchestra hem /gorchestra/ çalışsın)
+		s.mux.HandleFunc("/gorchestra", s.handleDashboard)
+		s.mux.HandleFunc("/gorchestra/", s.handleDashboard)
+		s.mux.HandleFunc("/gorchestra/snapshots", s.handleSnapshotsJSON)
+		s.mux.HandleFunc("/gorchestra/topics", s.handleTopicsJSON)
+	}
 
 	if s.opt.EnablePProf {
 		s.mountPProf(s.mux)
@@ -93,46 +101,96 @@ func (s *Server) RegisterTopic(name string, f topicStatsFn) {
 	s.muTopics.Unlock()
 }
 
+// Start binds the listener and serves HTTP, blocking until Stop is called
+// (or the server fails). Bind errors are returned synchronously. Use
+// StartAsync to serve in a background goroutine.
 func (s *Server) Start() error {
-	// CPU sampler
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.sampleProcessCPU(s.opt.CPUSampleInterval)
-	}()
+	ln, err := net.Listen("tcp", s.opt.Addr)
+	if err != nil {
+		return err
+	}
+	s.setListener(ln)
+	s.startBackground()
 
-	// Topic sampler
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		tk := time.NewTicker(s.opt.TopicSampleInterval)
-		defer tk.Stop()
-		for {
-			select {
-			case <-s.stopC:
-				return
-			case <-tk.C:
-				s.updateTopicGauges()
-			}
-		}
-	}()
+	err = s.http.Serve(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
 
-	// HTTP
+// StartAsync binds the listener and serves HTTP in a background goroutine.
+// Bind errors are returned synchronously; call Stop to shut the server down.
+func (s *Server) StartAsync() error {
+	ln, err := net.Listen("tcp", s.opt.Addr)
+	if err != nil {
+		return err
+	}
+	s.setListener(ln)
+	s.startBackground()
+
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		if err := s.http.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Println("obs http error:", err)
-		}
+		_ = s.http.Serve(ln)
 	}()
 	return nil
 }
 
+func (s *Server) setListener(ln net.Listener) {
+	s.lnMu.Lock()
+	s.ln = ln
+	s.lnMu.Unlock()
+}
+
+// Addr returns the address the server is listening on, or "" before start.
+func (s *Server) Addr() string {
+	s.lnMu.Lock()
+	defer s.lnMu.Unlock()
+	if s.ln == nil {
+		return ""
+	}
+	return s.ln.Addr().String()
+}
+
+// startBackground launches the CPU and topic samplers exactly once.
+func (s *Server) startBackground() {
+	s.startOnce.Do(func() {
+		// CPU sampler
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.sampleProcessCPU(s.opt.CPUSampleInterval)
+		}()
+
+		// Topic sampler
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			tk := time.NewTicker(s.opt.TopicSampleInterval)
+			defer tk.Stop()
+			for {
+				select {
+				case <-s.stopC:
+					return
+				case <-tk.C:
+					s.updateTopicGauges()
+				}
+			}
+		}()
+	})
+}
+
+// Stop gracefully shuts the HTTP server down and stops the samplers. It is
+// safe to call multiple times.
 func (s *Server) Stop(ctx context.Context) error {
-	close(s.stopC)
-	_ = s.http.Shutdown(ctx)
+	var err error
+	s.stopOnce.Do(func() {
+		close(s.stopC)
+		err = s.http.Shutdown(ctx)
+	})
 	s.wg.Wait()
-	return nil
+	return err
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {

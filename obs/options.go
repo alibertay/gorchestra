@@ -19,8 +19,8 @@ type Options struct {
 
 func defaults() Options {
 	return Options{
-		Addr:                ":9090",
-		EnablePProf:         true,
+		Addr:                "127.0.0.1:9090",
+		EnablePProf:         false, // opt-in: pprof endpoints should not be public
 		EnableDashboard:     true,
 		CPUSampleInterval:   time.Second,
 		TopicSampleInterval: 500 * time.Millisecond,
