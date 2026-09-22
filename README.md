@@ -492,6 +492,7 @@ Go 1.23+ (see `go.mod`).
 ## Version & Requirements
 
 - Go **1.23+** (toolchain 1.24 supported)
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
 - CI: GitHub Actions runs `go build`, `go vet` and `go test -race ./...`
 - Optional: `github.com/prometheus/client_golang` if you enable metrics/server
 - Optional: `go.uber.org/goleak` for tests
