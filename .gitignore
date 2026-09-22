@@ -1,0 +1,12 @@
+# Local notes / vault (never pushed)
+vault/
+
+# Build artifacts
+*.exe
+*.test
+*.out
+*.prof
+
+# Coverage
+coverage.txt
+coverage.html
