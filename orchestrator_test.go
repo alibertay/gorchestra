@@ -228,6 +228,24 @@ func TestOrchestrator_TryGoAfterShutdownRejected(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_RejectedRoutineContextIsCancelled(t *testing.T) {
+	o := New()
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	r, err := o.TryGo(func(ctx context.Context, self *Routine) error { return nil })
+	if !errors.Is(err, ErrOrchestratorClosed) {
+		t.Fatalf("expected ErrOrchestratorClosed, got %v", err)
+	}
+
+	select {
+	case <-r.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("rejected routine context must be cancelled")
+	}
+}
+
 func TestOrchestrator_GoAfterShutdownDoesNotRun(t *testing.T) {
 	o := New()
 	if err := o.Shutdown(time.Second); err != nil {

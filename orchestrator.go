@@ -123,6 +123,9 @@ func (o *Orchestrator) TryGo(fn func(ctx context.Context, self *Routine) error, 
 	o.mu.Lock()
 	if o.lifecycle != OrchestratorOpen {
 		o.mu.Unlock()
+		// A terminal routine must have a done context, exactly like a
+		// routine whose worker ran and finished.
+		r.cancel()
 		r.finish(StateStopped, ErrOrchestratorClosed)
 		r.markRetired()
 		return r, ErrOrchestratorClosed
