@@ -2,6 +2,7 @@ package gorchestra
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -123,18 +124,41 @@ func sizeOf[T any](v T) int {
 	}
 }
 
-// Bus (aynı)
+// Bus is a thread-safe registry of named topic channels. Topic may be
+// called concurrently; the first caller wins and later callers receive the
+// same channel.
 type Bus[T any] struct {
+	mu     sync.RWMutex
 	lookup map[string]*Channel[T]
 }
 
 func NewBus[T any]() *Bus[T] { return &Bus[T]{lookup: make(map[string]*Channel[T])} }
 
 func (b *Bus[T]) Topic(name string, capacity int) *Channel[T] {
+	b.mu.RLock()
+	ch, ok := b.lookup[name]
+	b.mu.RUnlock()
+	if ok {
+		return ch
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if ch, ok := b.lookup[name]; ok {
 		return ch
 	}
-	ch := NewChannel[T](capacity)
+	ch = NewChannel[T](capacity)
 	b.lookup[name] = ch
 	return ch
+}
+
+// Topics returns the names of all registered topics.
+func (b *Bus[T]) Topics() []string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	out := make([]string, 0, len(b.lookup))
+	for name := range b.lookup {
+		out = append(out, name)
+	}
+	return out
 }
