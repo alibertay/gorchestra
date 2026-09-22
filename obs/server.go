@@ -84,6 +84,8 @@ func NewServer(o *g.Orchestrator, opts ...Option) *Server {
 		s.mux.HandleFunc("/gorchestra/", s.handleDashboard)
 		s.mux.HandleFunc("/gorchestra/snapshots", s.handleSnapshotsJSON)
 		s.mux.HandleFunc("/gorchestra/topics", s.handleTopicsJSON)
+		s.mux.HandleFunc("/gorchestra/history", s.handleHistoryJSON)
+		s.mux.HandleFunc("/gorchestra/terminals", s.handleTerminalsJSON)
 	}
 
 	if s.opt.EnablePProf {
@@ -207,6 +209,52 @@ func (s *Server) handleSnapshotsJSON(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	j := s.o.PublicSnapshots()
 	_ = json.NewEncoder(w).Encode(j)
+}
+
+type historyItem struct {
+	ID            uint64   `json:"id"`
+	Name          string   `json:"name"`
+	State         string   `json:"state"`
+	Health        g.Health `json:"health"`
+	Restarts      uint64   `json:"restarts"`
+	UptimeSeconds float64  `json:"uptimeSeconds"`
+	FinishedAt    string   `json:"finishedAt"`
+	Err           string   `json:"err,omitempty"`
+}
+
+func (s *Server) handleHistoryJSON(w http.ResponseWriter, _ *http.Request) {
+	recs := s.o.History()
+	out := make([]historyItem, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, historyItem{
+			ID:            r.ID,
+			Name:          r.Name,
+			State:         r.State.String(),
+			Health:        r.Health,
+			Restarts:      r.Restarts,
+			UptimeSeconds: r.Uptime.Seconds(),
+			FinishedAt:    r.FinishedAt.Format(time.RFC3339),
+			Err:           r.Err,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+type terminalItem struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+	Count uint64 `json:"count"`
+}
+
+func (s *Server) handleTerminalsJSON(w http.ResponseWriter, _ *http.Request) {
+	counts := s.o.TerminalCounts()
+	out := make([]terminalItem, 0, len(counts))
+	for _, c := range counts {
+		out = append(out, terminalItem{Name: c.Name, State: c.State.String(), Count: c.Count})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 func (s *Server) handleTopicsJSON(w http.ResponseWriter, _ *http.Request) {

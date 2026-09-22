@@ -2,6 +2,7 @@ package obs
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -93,13 +94,73 @@ func TestServer_DashboardDisabled(t *testing.T) {
 	}
 	defer func() { _ = s.Stop(context.Background()) }()
 
-	resp, _ := get(t, s, "/gorchestra")
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("disabled dashboard must return 404, got %d", resp.StatusCode)
+	for _, path := range []string{
+		"/gorchestra",
+		"/gorchestra/snapshots",
+		"/gorchestra/history",
+		"/gorchestra/terminals",
+	} {
+		resp, _ := get(t, s, path)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("disabled dashboard: %s must return 404, got %d", path, resp.StatusCode)
+		}
 	}
-	resp, _ = get(t, s, "/gorchestra/snapshots")
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("disabled dashboard JSON must return 404, got %d", resp.StatusCode)
+}
+
+func TestServer_HistoryAndTerminalsEndpoints(t *testing.T) {
+	o := g.New()
+	r := o.Go(func(ctx context.Context, self *g.Routine) error { return nil }, g.WithName("worker"))
+	if err := r.Wait(); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	s := NewServer(o, WithAddr("127.0.0.1:0"))
+	if err := s.StartAsync(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Stop(context.Background()) }()
+
+	resp, body := get(t, s, "/gorchestra/history")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("history status: %d", resp.StatusCode)
+	}
+	var hist []map[string]any
+	if err := json.Unmarshal([]byte(body), &hist); err != nil {
+		t.Fatalf("history json: %v", err)
+	}
+	if len(hist) != 1 {
+		t.Fatalf("expected 1 history record, got %d", len(hist))
+	}
+	if hist[0]["name"] != "worker" || hist[0]["state"] != "STOPPED" {
+		t.Fatalf("unexpected history record: %v", hist[0])
+	}
+
+	resp, body = get(t, s, "/gorchestra/terminals")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("terminals status: %d", resp.StatusCode)
+	}
+	var terms []struct {
+		Name  string `json:"name"`
+		State string `json:"state"`
+		Count uint64 `json:"count"`
+	}
+	if err := json.Unmarshal([]byte(body), &terms); err != nil {
+		t.Fatalf("terminals json: %v", err)
+	}
+	if len(terms) != 1 || terms[0].Name != "worker" || terms[0].State != "STOPPED" || terms[0].Count != 1 {
+		t.Fatalf("unexpected terminal counts: %+v", terms)
+	}
+
+	resp, body = get(t, s, "/gorchestra/snapshots")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("snapshots status: %d", resp.StatusCode)
+	}
+	var snaps []map[string]any
+	if err := json.Unmarshal([]byte(body), &snaps); err != nil {
+		t.Fatalf("snapshots json: %v", err)
+	}
+	if len(snaps) != 0 {
+		t.Fatalf("expected no active routines, got %d", len(snaps))
 	}
 }
 

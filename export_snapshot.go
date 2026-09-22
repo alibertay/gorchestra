@@ -14,6 +14,7 @@ type PublicSnapshot struct {
 	// SupervisorState is empty for non-supervised routines.
 	SupervisorState string `json:"supervisorState,omitempty"`
 	QueueLen        int    `json:"queueLen"`
+	QueueCap        int    `json:"queueCap"`
 	QueueBytes      int64  `json:"queueBytes"`
 	Restarts        uint64 `json:"restarts"`
 }
@@ -39,6 +40,7 @@ func (o *Orchestrator) PublicSnapshots() []PublicSnapshot {
 			BusyPercent:     s.BusyPercent,
 			SupervisorState: sup,
 			QueueLen:        s.QueueLen,
+			QueueCap:        s.QueueCap,
 			QueueBytes:      s.QueueBytes,
 			Restarts:        s.Restarts,
 		})

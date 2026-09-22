@@ -12,11 +12,13 @@ th, td { border-bottom:1px solid #eee; padding:6px 8px; text-align:left; font-si
 .badge { padding:2px 6px; border-radius:4px; background:#eef; }
 .ok { background:#e6ffe6 }
 .stop { background:#ffe6e6 }
+.warn { background:#fff7e0 }
 .code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;}
 .grid { display:grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-.card { border:1px solid #eee; border-radius:10px; padding:12px; box-shadow: 0 1px 3px rgba(0,0,0,.04);}
+.card { border:1px solid #eee; border-radius:10px; padding:12px; box-shadow: 0 1px 3px rgba(0,0,0,.04); margin-bottom:18px;}
 .spark { width:160px; height:32px; }
 .footer { color:#777; font-size:12px; margin-top:10px; }
+.muted { color:#999; }
 </style>
 </head>
 <body>
@@ -33,13 +35,34 @@ th, td { border-bottom:1px solid #eee; padding:6px 8px; text-align:left; font-si
         <div>• /metrics (Prometheus)</div>
         <div>• /debug/pprof (profiling)</div>
         <div>• /gorchestra (this dashboard)</div>
+        <div>• /gorchestra/snapshots • /gorchestra/history • /gorchestra/terminals</div>
       </div>
     </div>
   </div>
 
   <div class="card">
-    <b>Routines</b>
-    <table id="tblR"><tr><th>ID</th><th>Name</th><th>State</th><th>Health</th><th>Restarts</th><th>Queue</th></tr></table>
+    <b>Routines</b> <small class="muted">(active)</small>
+    <table id="tblR">
+      <tr>
+        <th>ID</th><th>Name</th><th>State</th><th>Health</th><th>Supervisor</th><th>Restarts</th>
+        <th>Uptime</th><th>Idle</th><th>Busy%</th><th>Blocked</th><th>Queue</th><th>Bytes</th>
+      </tr>
+    </table>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <b>History</b> <small class="muted">(last finished)</small>
+      <table id="tblH">
+        <tr><th>ID</th><th>Name</th><th>State</th><th>Restarts</th><th>Uptime</th><th>Finished</th><th>Err</th></tr>
+      </table>
+    </div>
+    <div class="card">
+      <b>Terminal counts</b>
+      <table id="tblC">
+        <tr><th>Name</th><th>State</th><th>Count</th></tr>
+      </table>
+    </div>
   </div>
 
   <div class="card">
@@ -51,6 +74,35 @@ th, td { border-bottom:1px solid #eee; padding:6px 8px; text-align:left; font-si
 const cpuHist = [];
 const MAX = 60;
 const safe = v => (v === undefined || v === null || v === "") ? "-" : v;
+const esc = v => String(safe(v)).replace(/[&<>"']/g, c => ({
+  '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+}[c]));
+
+function fmtDur(sec){
+  if (sec === undefined || sec === null) return "-";
+  const s = Number(sec);
+  if (!isFinite(s)) return "-";
+  if (s < 1) return (s*1000).toFixed(0) + "ms";
+  if (s < 60) return s.toFixed(1) + "s";
+  const m = Math.floor(s/60), r = Math.round(s%60);
+  if (m < 60) return m + "m" + r + "s";
+  const h = Math.floor(m/60);
+  return h + "h" + (m%60) + "m";
+}
+
+function fmtTime(iso){
+  if (!iso) return "-";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleTimeString();
+}
+
+function stateClass(state, health){
+  if (state === 'RUNNING') return health === 'OK' ? 'ok' : 'warn';
+  if (state === 'STOPPED') return 'stop';
+  if (state === 'TIMED_OUT' || state === 'PANICKED') return 'stop';
+  return '';
+}
 
 function drawSpark(id, arr){
   const c = document.getElementById(id);
@@ -80,23 +132,54 @@ async function tick(){
     }
   }catch{}
 
-  // Routines
+  // Active routines
   try{
     const r = await fetch('/gorchestra/snapshots').then(r=>r.json());
-    const rows = ['<tr><th>ID</th><th>Name</th><th>State</th><th>Health</th><th>Restarts</th><th>Queue</th></tr>'];
+    const rows = ['<tr><th>ID</th><th>Name</th><th>State</th><th>Health</th><th>Supervisor</th><th>Restarts</th><th>Uptime</th><th>Idle</th><th>Busy%</th><th>Blocked</th><th>Queue</th><th>Bytes</th></tr>'];
     r.forEach(s=>{
-      const id = safe(s.id);
-      const name = safe(s.name);
-      const state = safe(s.state);
-      const health = safe(s.health);
-      const restarts = safe(s.restarts);
-      const qlen = safe(s.queueLen);
-      const cls = state==='RUNNING'?'ok':(state==='STOPPED'?'stop':'');
+      const cls = stateClass(s.state, s.health);
+      const sup = s.supervisorState ? `<span class="badge">${esc(s.supervisorState)}</span>` : '<span class="muted">-</span>';
       rows.push(
-        `<tr class="${cls}"><td>${id}</td><td>${name}</td><td><span class="badge">${state}</span></td><td>${health}</td><td>${restarts}</td><td>${qlen}</td></tr>`
+        `<tr class="${cls}"><td>${esc(s.id)}</td><td>${esc(s.name)}</td>` +
+        `<td><span class="badge">${esc(s.state)}</span></td><td>${esc(s.health)}</td>` +
+        `<td>${sup}</td><td>${esc(s.restarts)}</td>` +
+        `<td>${fmtDur(s.uptimeSeconds)}</td><td>${fmtDur(s.idleSeconds)}</td>` +
+        `<td>${s.busyPercent === undefined ? "-" : Number(s.busyPercent).toFixed(1) + "%"}</td>` +
+        `<td>${fmtDur(s.blockedSeconds)}</td>` +
+        `<td>${esc(s.queueLen)}/${esc(s.queueCap)}</td><td>${esc(s.queueBytes)}</td></tr>`
       );
     });
     document.getElementById('tblR').innerHTML = rows.join('');
+  }catch(e){
+    console.error(e);
+  }
+
+  // History
+  try{
+    const h = await fetch('/gorchestra/history').then(r=>r.json());
+    const rows = ['<tr><th>ID</th><th>Name</th><th>State</th><th>Restarts</th><th>Uptime</th><th>Finished</th><th>Err</th></tr>'];
+    h.slice().reverse().forEach(x=>{
+      rows.push(
+        `<tr class="${stateClass(x.state, x.health)}"><td>${esc(x.id)}</td><td>${esc(x.name)}</td>` +
+        `<td><span class="badge">${esc(x.state)}</span></td><td>${esc(x.restarts)}</td>` +
+        `<td>${fmtDur(x.uptimeSeconds)}</td><td>${esc(fmtTime(x.finishedAt))}</td><td>${esc(x.err)}</td></tr>`
+      );
+    });
+    if(h.length === 0) rows.push('<tr><td colspan="7" class="muted">no finished routines yet</td></tr>');
+    document.getElementById('tblH').innerHTML = rows.join('');
+  }catch(e){
+    console.error(e);
+  }
+
+  // Terminal counts
+  try{
+    const c = await fetch('/gorchestra/terminals').then(r=>r.json());
+    const rows = ['<tr><th>Name</th><th>State</th><th>Count</th></tr>'];
+    c.forEach(x=>{
+      rows.push(`<tr><td>${esc(x.name)}</td><td><span class="badge">${esc(x.state)}</span></td><td>${esc(x.count)}</td></tr>`);
+    });
+    if(c.length === 0) rows.push('<tr><td colspan="3" class="muted">no terminal counters yet</td></tr>');
+    document.getElementById('tblC').innerHTML = rows.join('');
   }catch(e){
     console.error(e);
   }
@@ -106,7 +189,7 @@ async function tick(){
     const t = await fetch('/gorchestra/topics').then(r=>r.json());
     const rows = ['<tr><th>Name</th><th>Len/Cap</th><th>Bytes</th></tr>'];
     t.forEach(x=>{
-      rows.push(`<tr><td>${safe(x.name)}</td><td>${safe(x.stat.Len)}/${safe(x.stat.Cap)}</td><td>${safe(x.stat.ApproxBytes)}</td></tr>`);
+      rows.push(`<tr><td>${esc(x.name)}</td><td>${esc(x.stat.Len)}/${esc(x.stat.Cap)}</td><td>${esc(x.stat.ApproxBytes)}</td></tr>`);
     });
     document.getElementById('tblT').innerHTML = rows.join('');
   }catch(e){
