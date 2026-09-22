@@ -28,12 +28,31 @@ func defaults() Options {
 	}
 }
 
-func WithAddr(a string) Option                  { return func(o *Options) { o.Addr = a } }
-func WithPProf(v bool) Option                   { return func(o *Options) { o.EnablePProf = v } }
-func WithDashboard(v bool) Option               { return func(o *Options) { o.EnableDashboard = v } }
-func WithCPUSampleEvery(d time.Duration) Option { return func(o *Options) { o.CPUSampleInterval = d } }
+func WithAddr(a string) Option    { return func(o *Options) { o.Addr = a } }
+func WithPProf(v bool) Option     { return func(o *Options) { o.EnablePProf = v } }
+func WithDashboard(v bool) Option { return func(o *Options) { o.EnableDashboard = v } }
+
+// WithCPUSampleEvery sets the process CPU sampling period. Non-positive
+// values are ignored (the default is kept) so that time.NewTicker can never
+// panic.
+func WithCPUSampleEvery(d time.Duration) Option {
+	return func(o *Options) {
+		if d <= 0 {
+			return
+		}
+		o.CPUSampleInterval = d
+	}
+}
+
+// WithTopicSampleEvery sets the topic gauge refresh period. Non-positive
+// values are ignored (the default is kept).
 func WithTopicSampleEvery(d time.Duration) Option {
-	return func(o *Options) { o.TopicSampleInterval = d }
+	return func(o *Options) {
+		if d <= 0 {
+			return
+		}
+		o.TopicSampleInterval = d
+	}
 }
 func WithRegistry(r *prometheus.Registry) Option {
 	return func(o *Options) { o.Registry = r }
