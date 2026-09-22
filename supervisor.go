@@ -2,6 +2,7 @@ package gorchestra
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"time"
 )
@@ -64,6 +65,18 @@ func WithSupIdleTimeout(d time.Duration) SupervisorOption {
 }
 func WithSupQueueCap(n int) SupervisorOption { return func(c *SupervisorConfig) { c.QueueCap = n } }
 
+// runAttempt runs a single supervised worker attempt inside its own panic
+// boundary. A panic is converted into an error so the restart policy can
+// decide what to do with it.
+func runAttempt(fn func(ctx context.Context, self *Routine) error, ctx context.Context, self *Routine) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("gorchestra: supervised worker panic: %v", rec)
+		}
+	}()
+	return fn(ctx, self)
+}
+
 // GoSupervised: fn dönerse policy'e göre yeniden başlatır.
 func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) error, opts ...SupervisorOption) *Routine {
 	cfg := defaultSupCfg()
@@ -76,7 +89,7 @@ func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) 
 		for {
 			// her denemede yeni child-context
 			childCtx, cancel := context.WithCancel(ctx)
-			err := fn(childCtx, self)
+			err := runAttempt(fn, childCtx, self)
 			cancel()
 
 			if ctx.Err() != nil {
