@@ -143,6 +143,36 @@ func TestRoutine_TerminalStatesRejectTransitions(t *testing.T) {
 	}
 }
 
+func TestRoutine_IdleTimeoutDisabledByDefault(t *testing.T) {
+	if got := defaultRoutineOptions().IdleTimeout; got != 0 {
+		t.Fatalf("idle timeout must be disabled by default, got %v", got)
+	}
+
+	o := New()
+	defer func() { _ = o.Shutdown(time.Second) }()
+
+	r := o.Go(func(ctx context.Context, self *Routine) error {
+		time.Sleep(250 * time.Millisecond)
+		return nil
+	})
+	if err := r.Wait(); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if got := r.State(); got != StateStopped {
+		t.Fatalf("expected STOPPED, got %s", got)
+	}
+}
+
+func TestRoutine_WithIdleTimeout_ZeroAndNegativeDisable(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		opts := defaultRoutineOptions()
+		WithIdleTimeout(d)(&opts)
+		if opts.IdleTimeout != 0 {
+			t.Fatalf("WithIdleTimeout(%v) should disable idle timeout, got %v", d, opts.IdleTimeout)
+		}
+	}
+}
+
 func TestRoutine_HeartbeatPreventsTimeout(t *testing.T) {
 	o := New()
 	defer func() { _ = o.Shutdown(time.Second) }()

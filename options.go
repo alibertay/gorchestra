@@ -12,9 +12,11 @@ type RoutineOptions struct {
 
 func defaultRoutineOptions() RoutineOptions {
 	return RoutineOptions{
-		Name:        "",
-		QueueCap:    128,
-		IdleTimeout: 5 * time.Second,
+		Name:     "",
+		QueueCap: 128,
+		// Disabled by default: a routine is only cancelled for going idle
+		// when the caller explicitly opts in with WithIdleTimeout(d > 0).
+		IdleTimeout: 0,
 	}
 }
 
@@ -31,10 +33,13 @@ func WithQueueCap(n int) RoutineOption {
 	}
 }
 
+// WithIdleTimeout cancels the routine (StateTimedOut) when it stops calling
+// Beat() for the given duration. Pass 0 (or a negative value) to disable the
+// idle watchdog; it is disabled by default.
 func WithIdleTimeout(d time.Duration) RoutineOption {
 	return func(o *RoutineOptions) {
-		if d <= 0 {
-			return
+		if d < 0 {
+			d = 0
 		}
 		o.IdleTimeout = d
 	}
