@@ -1,4 +1,3 @@
-
 # gorchestra
 
 Goroutine orchestration & observability toolkit for Go. Manage worker lifecycles, supervise restarts with backoff, pass messages over typed channels, and expose live metrics & a tiny dashboard — all with minimal dependencies.
@@ -20,6 +19,7 @@ Goroutine orchestration & observability toolkit for Go. Manage worker lifecycles
 - [Core Concepts](#core-concepts)
   - [Orchestrator](#orchestrator)
   - [Routine](#routine)
+  - [Lifecycle & states](#lifecycle--states)
   - [Channel & Bus](#channel--bus)
   - [Supervisor](#supervisor)
   - [Observability Server](#observability-server)
@@ -41,17 +41,19 @@ Goroutine orchestration & observability toolkit for Go. Manage worker lifecycles
 ## Features
 
 - 🧵 **Managed goroutines** with a central `Orchestrator`
-- 💓 **Heartbeat & idle-timeout** guard (stop workers that go quiet)
-- 🔁 **Supervisor** with **restart policies** and **exponential backoff + jitter**
+- 🔒 **Hardened lifecycle state machine** — terminal states (`STOPPED`, `TIMED_OUT`, `PANICKED`) are final
+- 💓 **Heartbeat & opt-in idle-timeout** guard (stop workers that go quiet)
+- 🔁 **Supervisor** with **panic recovery**, **restart policies**, **exponential backoff + jitter** and **stable-window backoff reset**
+- 🧹 **Bounded history** for finished routines (active registry + ring buffer, no unbounded growth)
 - ✉️ **Typed mailbox/channel** with per-channel stats (len/cap/blocked/bytes)
-- 🚌 **Named bus** to create topic channels on demand
-- 📊 **Prometheus metrics** + **/metrics** endpoint
+- 🚌 **Thread-safe named bus** to create topic channels on demand
+- 📊 **Prometheus metrics** + **/metrics** endpoint with a bounded-cardinality strategy
 - 📈 **Tiny HTML dashboard** at `/gorchestra` (sortable table + live CPU/queues)
-- 🧠 **goleak**-friendly tests (no goroutine leaks)
-- 🧹 **Graceful shutdown** with bounded wait
+- 🧠 **goleak**-friendly tests (no goroutine leaks) + `go test -race` in CI
+- 🧹 **Graceful shutdown** with bounded wait, idempotent `Shutdown`/`Stop`
 - 🧰 No heavy framework; import what you need
 
-> Go’s runtime doesn’t expose per-goroutine CPU/mem. gorchestra approximates CPU/busyness via blocking/processing time it can observe (mailboxes; explicit `AddBusy`, etc.). Treat CPU% as a helpful, not exact, signal.
+> Go’s runtime doesn’t expose per-goroutine CPU/mem. gorchestra approximates busyness only from what you explicitly instrument (`AddBusy`, mailbox blocking). Treat `BusyPercent` as a helpful, not exact, signal — an uninstrumented worker reports `0`, never a fabricated `100`.
 
 ---
 
@@ -87,7 +89,9 @@ import (
 func main() {
     orch := g.New()
 
-    // Start a managed routine
+    // Start a managed routine.
+    // The idle watchdog is opt-in: pass WithIdleTimeout(d) and call Beat()
+    // while the worker is healthy.
     r := orch.Go(func(ctx context.Context, self *g.Routine) error {
         ticker := time.NewTicker(250 * time.Millisecond)
         defer ticker.Stop()
@@ -97,8 +101,8 @@ func main() {
             case <-ctx.Done():
                 return ctx.Err()
             case <-ticker.C:
-                self.Beat()             // heartbeat (resets idle timer)
-                self.AddBusy(10*time.Millisecond) // optional: record work time
+                self.Beat()                       // heartbeat (resets idle timer)
+                self.AddBusy(10 * time.Millisecond) // optional: record work time
                 // do work...
             }
         }
@@ -129,7 +133,7 @@ _ = msg; _ = err
 stats := ch.Stats() // Len/Cap/Sends/Recvs/Blocked[Send|Recv]Ns/ApproxBytes
 ```
 
-Or create a **bus** of named topics:
+Or create a **bus** of named topics (safe for concurrent use):
 
 ```go
 bus := g.NewBus[[]byte]()
@@ -141,24 +145,20 @@ _ = topic.Send(ctx, payload)
 
 ```go
 r := orch.GoSupervised(func(ctx context.Context, self *g.Routine) error {
-    for {
-        select {
-        case <-ctx.Done():
-            return ctx.Err()
-        default:
-            // do risky work; return error to trigger RestartOnFailure/Always
-            return nil
-        }
-    }
+    // do risky work; return an error (or panic) to trigger a restart
+    return doWork(ctx)
 },
     g.WithSupName("super-worker"),
-    g.WithSupPolicy(g.RestartOnFailure),
+    g.WithSupPolicy(g.RestartOnFailure), // RestartNever | RestartOnFailure | RestartAlways
     g.WithSupBackoff(500*time.Millisecond, 30*time.Second, 2.0, 0.2), // initial, max, multiplier, jitter
-    g.WithSupIdleTimeout(10*time.Second),
+    g.WithSupStableWindow(30*time.Second), // a stable attempt resets the backoff
+    g.WithSupIdleTimeout(10*time.Second),  // opt-in; the supervisor heartbeats during backoff
     g.WithSupQueueCap(128),
 )
 _ = r
 ```
+
+Panics inside a supervised worker are recovered per attempt and flow through the restart policy instead of killing the routine.
 
 ### Expose metrics & dashboard
 
@@ -172,23 +172,30 @@ import (
 func main() {
     orch := g.New()
 
-    // Start HTTP server with /metrics, /gorchestra, and optional pprof
     s := obs.NewServer(orch,
-        obs.WithAddr(":9090"),
-        obs.WithPProf(true),
+        obs.WithAddr("127.0.0.1:9090"),
+        obs.WithPProf(false),      // opt-in; disabled by default
         obs.WithDashboard(true),
         obs.WithCPUSampleEvery(500*time.Millisecond),
         obs.WithTopicSampleEvery(1*time.Second),
     )
-    go func() { log.Fatal(s.Start()) }()
+
+    // Option A: serve in the background (bind errors are returned here)
+    if err := s.StartAsync(); err != nil {
+        log.Fatal(err)
+    }
+
+    // Option B: block (Start returns bind/serve errors)
+    // if err := s.Start(); err != nil { log.Fatal(err) }
 
     // ...
+    // _ = s.Stop(context.Background()) // idempotent
 }
 ```
 
-- **Dashboard**: `GET http://localhost:9090/gorchestra`
-- **Prometheus**: `GET http://localhost:9090/metrics`
-- **pprof**: `GET http://localhost:9090/debug/pprof/` (if enabled)
+- **Dashboard**: `GET http://127.0.0.1:9090/gorchestra`
+- **Prometheus**: `GET http://127.0.0.1:9090/metrics`
+- **pprof**: `GET http://127.0.0.1:9090/debug/pprof/` (only when enabled)
 
 > You can also hook directly into Prometheus without the server via `metrics.NewPrometheusCollector(orch)`.
 
@@ -201,33 +208,57 @@ if err := orch.Shutdown(5 * time.Second); err != nil {
 }
 ```
 
+`Shutdown` and `obs.Server.Stop` are idempotent: calling them again is a no-op.
+
 ---
 
 ## Core Concepts
 
 ### Orchestrator
 
-Central registry of managed goroutines. Spawns routines, tracks their state, prints stats, shuts them down, and exposes snapshots for metrics/UI.
+Central registry of **active** goroutines. Spawns routines, tracks their state, prints stats, shuts them down, and exposes snapshots for metrics/UI. Finished routines are retired from the active registry into a **bounded history ring** (default: last 1000, configurable with `WithHistoryLimit`).
 
 ### Routine
 
-A managed goroutine with a unique ID & name. Provides a **context**, **heartbeat** (`Beat()`), **busy-time recording** (`AddBusy`), a **mailbox** (`Mailbox()`), **restart counter** (`Restarts()`), `Kill()` and `Wait()` helpers, and an **idle watchdog** (if `WithIdleTimeout` > 0).
+A managed goroutine with a unique ID & name. Provides a **context**, **heartbeat** (`Beat()`), **busy-time recording** (`AddBusy`), a **mailbox** (`Mailbox()`), **restart counter** (`Restarts()`), `Kill()`, `Wait()` and `State()` helpers.
+
+The **idle watchdog is opt-in**: pass `WithIdleTimeout(d > 0)` and call `Beat()` while the worker is healthy. If the routine goes quiet for `d`, it is cancelled with `StateTimedOut` and `Wait()` returns `ErrIdleTimeout`.
+
+### Lifecycle & states
+
+```text
+INIT
+ │
+ ▼
+RUNNING ──(fn returns)──────────────→ STOPPED
+   │
+   ├── Kill() ──────────────────────→ STOPPING → STOPPED
+   ├── idle watchdog ───────────────→ TIMED_OUT
+   └── panic ───────────────────────→ PANICKED
+```
+
+`STOPPED`, `TIMED_OUT` and `PANICKED` are **terminal**: once reached, no transition (including a late `Kill()`) can change them. A routine that is killed before its goroutine starts finishes as `STOPPED` without invoking `fn`.
 
 ### Channel & Bus
 
-A typed channel wrapper with additional stats and (optional) payload sizing via `Sizer{ SizeBytes() int }`. A `Bus[T]` lets you request or create named topic channels on demand.
+A typed channel wrapper with additional stats and (optional) payload sizing via `Sizer{ SizeBytes() int }`. A `Bus[T]` lets you request or create named topic channels on demand; `Topic()` is safe for concurrent callers and the first caller wins.
 
 ### Supervisor
 
-A thin wrapper that restarts a routine based on a policy and backoff configuration. Useful for “always-on” workers that may fail transiently.
+A wrapper that runs `fn` under a restart policy and exponential backoff with jitter. Each attempt runs inside its own panic boundary. Attempts that ran at least `WithSupStableWindow` reset the backoff to its initial value, and the supervisor keeps heartbeating while waiting out a backoff delay.
 
 ### Observability Server
 
-A small HTTP server that ships with gorchestra. It serves Prometheus metrics, a tiny dashboard, and optionally pprof. It also samples **process CPU usage** and exports gauges for topic lengths/bytes so you see backpressure build-ups.
+A small HTTP server that ships with gorchestra. It serves Prometheus metrics, a tiny dashboard, and optionally pprof. It also samples **process CPU usage** and exports gauges for topic lengths/bytes so you see backpressure build-ups. Safe defaults: listens on `127.0.0.1:9090` and pprof is disabled unless requested.
 
 ### Prometheus Collector
 
-If you already have your own HTTP stack, you can register the standalone collector and expose it yourself.
+If you already have your own HTTP stack, register the standalone collector and expose it yourself.
+
+Cardinality strategy:
+
+- per-routine series (`id` label) exist **only while the routine is active**
+- finished routines are aggregated into `gorchestra_routines_terminal_total{name,state}`, bounded by worker names — not by routine IDs
 
 ---
 
@@ -242,8 +273,11 @@ If you already have your own HTTP stack, you can register the standalone collect
 ### Orchestrator API
 
 ```go
-// Create a new orchestrator
-func New() *Orchestrator
+// Create a new orchestrator (optional: WithHistoryLimit)
+func New(opts ...OrchestratorOption) *Orchestrator
+
+// Bound the finished-routine history ring (0 disables it; default 1000)
+func WithHistoryLimit(n int) OrchestratorOption
 
 // Run a managed routine once
 func (o *Orchestrator) Go(
@@ -257,9 +291,14 @@ func (o *Orchestrator) GoSupervised(
     opts ...SupervisorOption,
 ) *Routine
 
-// Lookup & listing
+// Lookup & listing (active routines only)
 func (o *Orchestrator) Get(id uint64) (*Routine, bool)
 func (o *Orchestrator) List() []*Routine
+
+// Bounded history of finished routines
+func (o *Orchestrator) History() []RoutineRecord
+func (o *Orchestrator) GetRecord(id uint64) (RoutineRecord, bool)
+func (o *Orchestrator) TerminalCounts() []TerminalCount
 
 // Printing current stats in a table
 func (o *Orchestrator) PrintStats(w io.Writer)
@@ -267,18 +306,23 @@ func (o *Orchestrator) PrintStats(w io.Writer)
 // Stop all routines now (best-effort cancel)
 func (o *Orchestrator) KillAll()
 
-// Wait for drain with a bound (best-effort)
+// Wait for drain with a bound (best-effort, idempotent)
 func (o *Orchestrator) Shutdown(d time.Duration) error
 
-// Stable snapshot for metrics/UI
+// Stable snapshot for metrics/UI (active routines)
 type PublicSnapshot struct {
-    ID         uint64 `json:"id"`
-    Name       string `json:"name"`
-    State      string `json:"state"` // INIT/RUNNING/STOPPING/TIMED_OUT/PANICKED/STOPPED
-    Health     Health `json:"health"` // OK/IDLE_TIMEOUT/STOPPING/...
-    QueueLen   int    `json:"queueLen"`
-    QueueBytes int64  `json:"queueBytes"`
-    Restarts   uint64 `json:"restarts"`
+    ID          uint64  `json:"id"`
+    Name        string  `json:"name"`
+    State       string  `json:"state"` // INIT/RUNNING/STOPPING/TIMED_OUT/PANICKED/STOPPED
+    Health      Health  `json:"health"` // OK/IDLE_TIMEOUT/STOPPING/PANIC
+    UptimeSec   float64 `json:"uptimeSeconds"`
+    IdleSec     float64 `json:"idleSeconds"`
+    BusySec     float64 `json:"busySeconds"`
+    BlockedSec  float64 `json:"blockedSeconds"`
+    BusyPercent float64 `json:"busyPercent"`
+    QueueLen    int     `json:"queueLen"`
+    QueueBytes  int64   `json:"queueBytes"`
+    Restarts    uint64  `json:"restarts"`
 }
 func (o *Orchestrator) PublicSnapshots() []PublicSnapshot
 ```
@@ -291,21 +335,28 @@ const (
     StateInit StateRunning StateStopping StateTimedOut StatePanicked StateStopped
 )
 
+// Terminal reports whether the state is final.
+func (s RoutineState) Terminal() bool
+
+// ErrIdleTimeout is returned by Wait() when the idle watchdog fired.
+var ErrIdleTimeout error
+
 func (r *Routine) ID() uint64
 func (r *Routine) Name() string
+func (r *Routine) State() RoutineState
 func (r *Routine) Context() context.Context
 func (r *Routine) Mailbox() *Channel[any]
 
 func (r *Routine) Restarts() uint64
 func (r *Routine) Beat()                    // heartbeat (resets idle timer)
 func (r *Routine) AddBusy(d time.Duration)  // add "busy" time (approx CPU)
-func (r *Routine) Kill()
+func (r *Routine) Kill()                    // no-op on terminal routines
 func (r *Routine) Wait() error
 
 // Routine options
 func WithName(n string) RoutineOption
 func WithQueueCap(n int) RoutineOption
-func WithIdleTimeout(d time.Duration) RoutineOption
+func WithIdleTimeout(d time.Duration) RoutineOption // 0 disables (default)
 ```
 
 ### Channel & Bus API
@@ -330,7 +381,8 @@ func (c *Channel[T]) Stats() ChannelStats
 
 type Bus[T any] struct{ /* ... */ }
 func NewBus[T any]() *Bus[T]
-func (b *Bus[T]) Topic(name string, capacity int) *Channel[T]
+func (b *Bus[T]) Topic(name string, capacity int) *Channel[T] // thread-safe
+func (b *Bus[T]) Topics() []string
 ```
 
 ### Supervisor options
@@ -346,6 +398,9 @@ func WithSupName(n string) SupervisorOption
 func WithSupPolicy(p RestartPolicy) SupervisorOption
 // initial, max, multiplier (>=1), jitter (0..1)
 func WithSupBackoff(initial, max time.Duration, mult float64, jitter float64) SupervisorOption
+// attempts running at least d reset the backoff (0 disables; default 30s)
+func WithSupStableWindow(d time.Duration) SupervisorOption
+// 0 disables the idle watchdog (default); supervisor heartbeats during backoff
 func WithSupIdleTimeout(d time.Duration) SupervisorOption
 func WithSupQueueCap(n int) SupervisorOption
 ```
@@ -355,30 +410,40 @@ func WithSupQueueCap(n int) SupervisorOption
 ```go
 // obs.NewServer wires HTTP mux with metrics, dashboard and optional pprof
 s := obs.NewServer(orch,
-    obs.WithAddr(":9090"),
-    obs.WithPProf(true),
-    obs.WithDashboard(true),
+    obs.WithAddr("127.0.0.1:9090"),
+    obs.WithPProf(false),     // default false
+    obs.WithDashboard(true),  // default true
     obs.WithCPUSampleEvery(500*time.Millisecond),
     obs.WithTopicSampleEvery(1*time.Second),
     // Optionally use your own Prometheus registry:
     // obs.WithRegistry(prometheus.NewRegistry()),
 )
 
-// Control server lifecycle
-if err := s.Start(); err != nil { /* ... */ }
-_ = s.Stop(context.Background())
+// Lifecycle
+if err := s.StartAsync(); err != nil { /* bind error */ } // background
+// or: if err := s.Start(); err != nil { /* blocks until Stop */ }
+_ = s.Addr() // actual listening address
+_ = s.Stop(context.Background()) // idempotent
 ```
 
 The server mounts:
 - `/metrics` (Prometheus; uses the same snapshots as the UI)
-- `/gorchestra` (static HTML dashboard)
-- `/debug/pprof/*` (when enabled)
+- `/gorchestra` (static HTML dashboard + `/gorchestra/snapshots`, `/gorchestra/topics`) — only when the dashboard is enabled
+- `/debug/pprof/*` (only when enabled)
+- `/healthz`
 
 ---
 
 ## Testing & Leak Safety
 
-The repo includes `goleak_test.go` with `go.uber.org/goleak` integration to ensure shutdown paths don’t leak goroutines.
+The repo integrates `go.uber.org/goleak` in the core and `obs` packages to ensure shutdown paths don’t leak goroutines, and CI runs the whole suite with the race detector:
+
+```bash
+go test ./...
+go test -race ./...
+```
+
+Covered behaviors include: normal completion, `Kill`, idle timeout, panic, terminal-state stability, supervised error/panic restarts, `RestartNever`/`RestartAlways`, backoff reset/cap/jitter, concurrent `Bus.Topic`, concurrent channel send/recv, shutdown timeout, repeated `Shutdown`/`Stop`, bounded history, and metric cardinality.
 
 Tips:
 - Always `Kill()` routine(s) and `Shutdown()` the orchestrator at test end.
@@ -390,28 +455,34 @@ Tips:
 ## Design Notes & Guarantees
 
 - **No hidden magic**: You control contexts and cancellation boundaries.
-- **Idle watchdog**: If `WithIdleTimeout` > 0 and the routine doesn’t call `Beat()` within that period, gorchestra cancels it with `StateTimedOut`.
-- **Busy/CPU approximation**: `AddBusy` and measured channel blocking capture a rough “how hot is this routine?” signal.
+- **Lifecycle**: explicit state machine; terminal states (`STOPPED`, `TIMED_OUT`, `PANICKED`) are final. The routine context is cancelled when the worker exits, so watchdogs never outlive the routine.
+- **Idle watchdog is opt-in**: only `WithIdleTimeout(d > 0)` enables it; on timeout the state becomes `TIMED_OUT` and `Wait()` returns `ErrIdleTimeout`.
+- **Supervision**: panics are recovered per attempt and treated as failures; backoff resets after a stable attempt; heartbeats continue during backoff.
+- **Bounded memory**: finished routines leave the active registry; history is a fixed-size ring.
+- **Busy metric**: `BusyPercent` reflects only explicit `AddBusy` instrumentation.
 - **Payload sizing**: If your channel payload implements `Sizer`, queue bytes are estimated; otherwise bytes may be `0`.
-- **Best-effort shutdown**: `KillAll()` cancels; `Shutdown(d)` waits up to `d` (total) for all routines to exit.
-- **Thread-safe**: Public orchestrator methods use RW locks where appropriate.
-- **No panics**: Library code avoids panics; your worker may panic — use `GoSupervised` with `RestartOnFailure/Always` for resilience.
+- **Best-effort shutdown**: `KillAll()` cancels; `Shutdown(d)` waits up to `d` (total) for all routines to exit; repeated calls are safe.
+- **Thread-safe**: Public orchestrator, bus and server methods are safe for concurrent use.
+- **No panics from the library**: worker panics are captured by the routine or the supervisor.
 
 ---
 
 ## FAQ
 
 **Q: Do I need the dashboard to use gorchestra?**  
-No. You can use only the orchestration pieces. The obs server is optional.
+No. You can use only the orchestration pieces. The obs server is optional, and `obs.WithDashboard(false)` disables `/gorchestra` routes entirely.
 
 **Q: Can I plug metrics into an existing HTTP server?**  
 Yes. Use `metrics.NewPrometheusCollector(orch)` and register it on your own `*prometheus.Registry` or the default one.
 
-**Q: Is CPU% accurate per goroutine?**  
-It’s an approximation based on what gorchestra can observe (blocked times, explicit busy windows). For precision, rely on end-to-end timings and system profilers.
+**Q: Is BusyPercent accurate per goroutine?**  
+It’s strictly what you instrumented with `AddBusy` relative to uptime. Uninstrumented workers report `0`. For precision, rely on end-to-end timings and system profilers.
 
 **Q: How do I stop a stuck worker?**  
-Call `Kill()` on the `Routine`, or configure an `IdleTimeout` and ensure your worker calls `Beat()` when alive.
+Call `Kill()` on the `Routine`, or enable an idle timeout (`WithIdleTimeout`) and call `Beat()` when the worker is alive.
+
+**Q: What happens if a supervised worker panics?**  
+The panic is recovered, converted into an error, and the restart policy decides: `RestartOnFailure`/`RestartAlways` restart it with backoff, `RestartNever` surfaces the error through `Wait()`.
 
 **Q: What Go versions are supported?**  
 Go 1.23+ (see `go.mod`).
@@ -421,5 +492,12 @@ Go 1.23+ (see `go.mod`).
 ## Version & Requirements
 
 - Go **1.23+** (toolchain 1.24 supported)
+- CI: GitHub Actions runs `go build`, `go vet` and `go test -race ./...`
 - Optional: `github.com/prometheus/client_golang` if you enable metrics/server
 - Optional: `go.uber.org/goleak` for tests
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
