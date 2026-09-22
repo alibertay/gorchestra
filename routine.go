@@ -123,10 +123,12 @@ type Routine struct {
 	restarts atomic.Uint64
 	supState atomic.Int32 // SupervisorState (only meaningful for supervised routines)
 
-	doneOnce sync.Once
-	doneCh   chan struct{}
-	errMu    sync.Mutex
-	err      error
+	doneOnce   sync.Once
+	doneCh     chan struct{}
+	retireOnce sync.Once
+	retireCh   chan struct{}
+	errMu      sync.Mutex
+	err        error
 
 	// config
 	idleTimeout time.Duration
@@ -143,6 +145,7 @@ func newRoutine(id uint64, name string, idle time.Duration, queueCap int, clock 
 		cancel:      cancel,
 		mbox:        NewChannel[any](queueCap),
 		doneCh:      make(chan struct{}),
+		retireCh:    make(chan struct{}),
 		idleTimeout: idle,
 		clock:       clock,
 	}
@@ -185,7 +188,21 @@ func (r *Routine) AddBusy(d time.Duration) {
 		r.busyNs.Add(d.Nanoseconds())
 	}
 }
-func (r *Routine) Wait() error { <-r.doneCh; r.errMu.Lock(); defer r.errMu.Unlock(); return r.err }
+// Wait blocks until the routine has finished and, when it is managed by an
+// orchestrator, until it has been retired into the bounded history. That
+// makes `r.Wait(); o.GetRecord(r.ID())` deterministic.
+func (r *Routine) Wait() error {
+	<-r.doneCh
+	<-r.retireCh
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+	return r.err
+}
+
+// markRetired is called by the orchestrator once bookkeeping is complete.
+func (r *Routine) markRetired() {
+	r.retireOnce.Do(func() { close(r.retireCh) })
+}
 
 // transition atomically moves the routine to the given state. It returns
 // false if the transition is not allowed (e.g. the routine is already in a

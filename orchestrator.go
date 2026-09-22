@@ -124,6 +124,7 @@ func (o *Orchestrator) TryGo(fn func(ctx context.Context, self *Routine) error, 
 	if o.lifecycle != OrchestratorOpen {
 		o.mu.Unlock()
 		r.finish(StateStopped, ErrOrchestratorClosed)
+		r.markRetired()
 		return r, ErrOrchestratorClosed
 	}
 	o.routines[id] = r
@@ -134,6 +135,7 @@ func (o *Orchestrator) TryGo(fn func(ctx context.Context, self *Routine) error, 
 		defer o.wg.Done()
 		r.run(fn)
 		o.retire(r)
+		r.markRetired()
 	}()
 
 	return r, nil

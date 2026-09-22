@@ -57,6 +57,24 @@ func TestOrchestrator_CompletedRoutinesLeaveActiveRegistry(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_WaitMakesHistoryVisible(t *testing.T) {
+	o := New()
+	defer func() { _ = o.Shutdown(time.Second) }()
+
+	r := o.Go(func(ctx context.Context, self *Routine) error { return nil })
+	if err := r.Wait(); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	// No Shutdown in between: Wait must guarantee retirement.
+	if _, ok := o.GetRecord(r.ID()); !ok {
+		t.Fatal("after Wait returns the routine must already be in history")
+	}
+	if got := o.List(); len(got) != 0 {
+		t.Fatalf("after Wait the routine must not be active, got %d", len(got))
+	}
+}
+
 func TestOrchestrator_GetRecordFromHistory(t *testing.T) {
 	o := New()
 	r := o.Go(func(ctx context.Context, self *Routine) error { return nil })
