@@ -41,15 +41,18 @@ Goroutine orchestration & observability toolkit for Go. Manage worker lifecycles
 ## Features
 
 - 🧵 **Managed goroutines** with a central `Orchestrator`
-- 🔒 **Hardened lifecycle state machine** — terminal states (`STOPPED`, `TIMED_OUT`, `PANICKED`) are final
+- 🔐 **Orchestrator lifecycle** — `OPEN → CLOSING → CLOSED`; once shutdown starts new routines are refused (`TryGo`, `ErrOrchestratorClosed`)
+- 🔒 **Hardened routine state machine** — terminal states (`STOPPED`, `TIMED_OUT`, `PANICKED`) are final
 - 💓 **Heartbeat & opt-in idle-timeout** guard (stop workers that go quiet)
 - 🔁 **Supervisor** with **panic recovery**, **restart policies**, **exponential backoff + jitter** and **stable-window backoff reset**
+- 👁 **Supervisor state visibility** — `RUNNING`/`BACKOFF`/`STOPPING` on routines, snapshots and metrics
 - 🧹 **Bounded history** for finished routines (active registry + ring buffer, no unbounded growth)
-- ✉️ **Typed mailbox/channel** with per-channel stats (len/cap/blocked/bytes)
+- ✉️ **Typed mailbox/channel** with per-channel stats (len/cap/blocked/bytes); blocked time measures only real waits
 - 🚌 **Thread-safe named bus** to create topic channels on demand
 - 📊 **Prometheus metrics** + **/metrics** endpoint with a bounded-cardinality strategy
-- 📈 **Tiny HTML dashboard** at `/gorchestra` (sortable table + live CPU/queues)
+- 📈 **Dashboard v2** at `/gorchestra` (activity, supervisor state, history, terminal counts, live CPU/queues)
 - 🧠 **goleak**-friendly tests (no goroutine leaks) + `go test -race` in CI
+- 🧪 **Stress & fuzz tests** (10k routines, shutdown races, restart storms, lifecycle fuzzing)
 - 🧹 **Graceful shutdown** with bounded wait, idempotent `Shutdown`/`Stop`
 - 🧰 No heavy framework; import what you need
 
@@ -218,11 +221,17 @@ if err := orch.Shutdown(5 * time.Second); err != nil {
 
 Central registry of **active** goroutines. Spawns routines, tracks their state, prints stats, shuts them down, and exposes snapshots for metrics/UI. Finished routines are retired from the active registry into a **bounded history ring** (default: last 1000, configurable with `WithHistoryLimit`).
 
+The orchestrator has an explicit lifecycle: `OPEN → CLOSING → CLOSED`. `Shutdown` moves it to `CLOSING` and refuses new routines (`TryGo` returns `ErrOrchestratorClosed`); after the drain completes it becomes `CLOSED`. A timed-out `Shutdown` stays `CLOSING` so a later call can finish the drain.
+
 ### Routine
 
 A managed goroutine with a unique ID & name. Provides a **context**, **heartbeat** (`Beat()`), **busy-time recording** (`AddBusy`), a **mailbox** (`Mailbox()`), **restart counter** (`Restarts()`), `Kill()`, `Wait()` and `State()` helpers.
 
+`Wait()` returns only after the worker finished **and** the routine was retired into history, so `r.Wait(); o.GetRecord(r.ID())` is deterministic.
+
 The **idle watchdog is opt-in**: pass `WithIdleTimeout(d > 0)` and call `Beat()` while the worker is healthy. If the routine goes quiet for `d`, it is cancelled with `StateTimedOut` and `Wait()` returns `ErrIdleTimeout`.
+
+Supervised routines additionally expose `SupervisorState()` (`RUNNING`/`BACKOFF`/`STOPPING`); plain `Go` routines report `SupervisorNone`.
 
 ### Lifecycle & states
 
@@ -239,6 +248,16 @@ RUNNING ──(fn returns)──────────────→ STOPPED
 
 `STOPPED`, `TIMED_OUT` and `PANICKED` are **terminal**: once reached, no transition (including a late `Kill()`) can change them. A routine that is killed before its goroutine starts finishes as `STOPPED` without invoking `fn`.
 
+The orchestrator has its own lifecycle:
+
+```text
+OPEN ──Shutdown()──→ CLOSING ──all routines drained──→ CLOSED
+                        ▲
+                        └── timeout: stays CLOSING, a later Shutdown completes it
+```
+
+While `CLOSING`/`CLOSED`, `TryGo` rejects new routines with `ErrOrchestratorClosed` (and `Go` returns an already-finished handle whose `Wait` returns that error).
+
 ### Channel & Bus
 
 A typed channel wrapper with additional stats and (optional) payload sizing via `Sizer{ SizeBytes() int }`. A `Bus[T]` lets you request or create named topic channels on demand; `Topic()` is safe for concurrent callers and the first caller wins.
@@ -247,9 +266,13 @@ A typed channel wrapper with additional stats and (optional) payload sizing via 
 
 A wrapper that runs `fn` under a restart policy and exponential backoff with jitter. Each attempt runs inside its own panic boundary. Attempts that ran at least `WithSupStableWindow` reset the backoff to its initial value, and the supervisor keeps heartbeating while waiting out a backoff delay.
 
+The supervised phase is observable: `Routine.SupervisorState()` (also in `PublicSnapshot.supervisorState` and the `gorchestra_supervisor_state` metric) tells you whether the worker is `RUNNING`, waiting in `BACKOFF`, or `STOPPING`.
+
 ### Observability Server
 
-A small HTTP server that ships with gorchestra. It serves Prometheus metrics, a tiny dashboard, and optionally pprof. It also samples **process CPU usage** and exports gauges for topic lengths/bytes so you see backpressure build-ups. Safe defaults: listens on `127.0.0.1:9090` and pprof is disabled unless requested.
+A small HTTP server that ships with gorchestra. It serves Prometheus metrics, a dashboard, and optionally pprof. It also samples **process CPU usage** and exports gauges for topic lengths/bytes so you see backpressure build-ups. Safe defaults: listens on `127.0.0.1:9090` and pprof is disabled unless requested.
+
+Dashboard v2 shows activity (uptime, idle, busy%, blocked, queue bytes), the supervisor phase, the bounded history and terminal counters; the same data is available as JSON from `/gorchestra/snapshots`, `/gorchestra/history` and `/gorchestra/terminals`.
 
 ### Prometheus Collector
 
@@ -259,6 +282,8 @@ Cardinality strategy:
 
 - per-routine series (`id` label) exist **only while the routine is active**
 - finished routines are aggregated into `gorchestra_routines_terminal_total{name,state}`, bounded by worker names — not by routine IDs
+- **routine names are expected to be low-cardinality labels** (`price-feed`, not `order-918272`); `WithTerminalCardinalityLimit(n)` caps distinct terminal series and buckets overflow under `OverflowRoutineName` (`__other__`)
+- supervised routines additionally export `gorchestra_supervisor_state{id,name,phase}`
 
 ---
 
@@ -273,17 +298,29 @@ Cardinality strategy:
 ### Orchestrator API
 
 ```go
-// Create a new orchestrator (optional: WithHistoryLimit)
+// Create a new orchestrator
 func New(opts ...OrchestratorOption) *Orchestrator
 
 // Bound the finished-routine history ring (0 disables it; default 1000)
 func WithHistoryLimit(n int) OrchestratorOption
+// Cap distinct terminal (name,state) series; overflow -> OverflowRoutineName.
+// 0 = unlimited (default). Routine names should be low-cardinality.
+func WithTerminalCardinalityLimit(n int) OrchestratorOption
+
+// Explicit lifecycle: OPEN / CLOSING / CLOSED
+func (o *Orchestrator) State() OrchestratorState
+var ErrOrchestratorClosed error
 
 // Run a managed routine once
 func (o *Orchestrator) Go(
     fn func(ctx context.Context, self *Routine) error,
     opts ...RoutineOption,
 ) *Routine
+// Like Go but reports ErrOrchestratorClosed after shutdown started.
+func (o *Orchestrator) TryGo(
+    fn func(ctx context.Context, self *Routine) error,
+    opts ...RoutineOption,
+) (*Routine, error)
 
 // Run a supervised routine that can restart based on policy/backoff
 func (o *Orchestrator) GoSupervised(
@@ -299,6 +336,7 @@ func (o *Orchestrator) List() []*Routine
 func (o *Orchestrator) History() []RoutineRecord
 func (o *Orchestrator) GetRecord(id uint64) (RoutineRecord, bool)
 func (o *Orchestrator) TerminalCounts() []TerminalCount
+const OverflowRoutineName = "__other__"
 
 // Printing current stats in a table
 func (o *Orchestrator) PrintStats(w io.Writer)
@@ -306,23 +344,25 @@ func (o *Orchestrator) PrintStats(w io.Writer)
 // Stop all routines now (best-effort cancel)
 func (o *Orchestrator) KillAll()
 
-// Wait for drain with a bound (best-effort, idempotent)
+// Wait for drain with a bound (best-effort, idempotent; timeouts stay CLOSING)
 func (o *Orchestrator) Shutdown(d time.Duration) error
 
 // Stable snapshot for metrics/UI (active routines)
 type PublicSnapshot struct {
-    ID          uint64  `json:"id"`
-    Name        string  `json:"name"`
-    State       string  `json:"state"` // INIT/RUNNING/STOPPING/TIMED_OUT/PANICKED/STOPPED
-    Health      Health  `json:"health"` // OK/IDLE_TIMEOUT/STOPPING/PANIC
-    UptimeSec   float64 `json:"uptimeSeconds"`
-    IdleSec     float64 `json:"idleSeconds"`
-    BusySec     float64 `json:"busySeconds"`
-    BlockedSec  float64 `json:"blockedSeconds"`
-    BusyPercent float64 `json:"busyPercent"`
-    QueueLen    int     `json:"queueLen"`
-    QueueBytes  int64   `json:"queueBytes"`
-    Restarts    uint64  `json:"restarts"`
+    ID              uint64  `json:"id"`
+    Name            string  `json:"name"`
+    State           string  `json:"state"` // INIT/RUNNING/STOPPING/TIMED_OUT/PANICKED/STOPPED
+    Health          Health  `json:"health"` // OK/IDLE_TIMEOUT/STOPPING/PANIC
+    UptimeSec       float64 `json:"uptimeSeconds"`
+    IdleSec         float64 `json:"idleSeconds"`
+    BusySec         float64 `json:"busySeconds"`
+    BlockedSec      float64 `json:"blockedSeconds"`
+    BusyPercent     float64 `json:"busyPercent"`
+    SupervisorState string  `json:"supervisorState,omitempty"` // RUNNING/BACKOFF/STOPPING
+    QueueLen        int     `json:"queueLen"`
+    QueueCap        int     `json:"queueCap"`
+    QueueBytes      int64   `json:"queueBytes"`
+    Restarts        uint64  `json:"restarts"`
 }
 func (o *Orchestrator) PublicSnapshots() []PublicSnapshot
 ```
@@ -341,9 +381,16 @@ func (s RoutineState) Terminal() bool
 // ErrIdleTimeout is returned by Wait() when the idle watchdog fired.
 var ErrIdleTimeout error
 
+// SupervisorState of a supervised routine: NONE/RUNNING/BACKOFF/STOPPING
+type SupervisorState int32
+const (
+    SupervisorNone SupervisorRunning SupervisorBackoff SupervisorStopping
+)
+
 func (r *Routine) ID() uint64
 func (r *Routine) Name() string
 func (r *Routine) State() RoutineState
+func (r *Routine) SupervisorState() SupervisorState
 func (r *Routine) Context() context.Context
 func (r *Routine) Mailbox() *Channel[any]
 
@@ -351,7 +398,7 @@ func (r *Routine) Restarts() uint64
 func (r *Routine) Beat()                    // heartbeat (resets idle timer)
 func (r *Routine) AddBusy(d time.Duration)  // add "busy" time (approx CPU)
 func (r *Routine) Kill()                    // no-op on terminal routines
-func (r *Routine) Wait() error
+func (r *Routine) Wait() error              // worker done + history retired
 
 // Routine options
 func WithName(n string) RoutineOption
@@ -384,6 +431,11 @@ func NewBus[T any]() *Bus[T]
 func (b *Bus[T]) Topic(name string, capacity int) *Channel[T] // thread-safe
 func (b *Bus[T]) Topics() []string
 ```
+
+Notes:
+
+- `BlockedSendNs`/`BlockedRecvNs` only count time actually spent waiting: a non-blocking fast path records nothing, so high-throughput pipelines are not polluted by scheduling noise.
+- An already-cancelled context fails deterministically (`ctx.Err()`), even when buffer space is available.
 
 ### Supervisor options
 
@@ -428,9 +480,11 @@ _ = s.Stop(context.Background()) // idempotent
 
 The server mounts:
 - `/metrics` (Prometheus; uses the same snapshots as the UI)
-- `/gorchestra` (static HTML dashboard + `/gorchestra/snapshots`, `/gorchestra/topics`) — only when the dashboard is enabled
+- `/gorchestra` (dashboard v2 + `/gorchestra/snapshots`, `/gorchestra/topics`, `/gorchestra/history`, `/gorchestra/terminals`) — only when the dashboard is enabled
 - `/debug/pprof/*` (only when enabled)
 - `/healthz`
+
+Sampling intervals are validated: non-positive values passed to `WithCPUSampleEvery`/`WithTopicSampleEvery` are ignored (defaults kept), so the server can never panic on a bad ticker duration.
 
 ---
 
@@ -441,9 +495,10 @@ The repo integrates `go.uber.org/goleak` in the core and `obs` packages to ensur
 ```bash
 go test ./...
 go test -race ./...
+go test -fuzz=FuzzRoutineStateTransitions -fuzztime=30s .
 ```
 
-Covered behaviors include: normal completion, `Kill`, idle timeout, panic, terminal-state stability, supervised error/panic restarts, `RestartNever`/`RestartAlways`, backoff reset/cap/jitter, concurrent `Bus.Topic`, concurrent channel send/recv, shutdown timeout, repeated `Shutdown`/`Stop`, bounded history, and metric cardinality.
+Covered behaviors include: normal completion, `Kill`, idle timeout, panic, terminal-state stability, orchestrator lifecycle (`TryGo` vs `Shutdown` races), supervised error/panic restarts, `RestartNever`/`RestartAlways`, backoff reset/cap/jitter, concurrent `Bus.Topic`, concurrent channel send/recv, shutdown timeout, repeated `Shutdown`/`Stop`, bounded history, metric cardinality, plus stress scenarios (10k routines, rapid create/destroy, restart storms, high topic throughput).
 
 Tips:
 - Always `Kill()` routine(s) and `Shutdown()` the orchestrator at test end.
@@ -455,13 +510,15 @@ Tips:
 ## Design Notes & Guarantees
 
 - **No hidden magic**: You control contexts and cancellation boundaries.
-- **Lifecycle**: explicit state machine; terminal states (`STOPPED`, `TIMED_OUT`, `PANICKED`) are final. The routine context is cancelled when the worker exits, so watchdogs never outlive the routine.
+- **Lifecycle**: explicit state machines for both routines and the orchestrator. Routine terminal states (`STOPPED`, `TIMED_OUT`, `PANICKED`) are final; the orchestrator moves `OPEN → CLOSING → CLOSED` and refuses new routines once shutdown starts. The routine context is cancelled when the worker exits, so watchdogs never outlive the routine.
+- **Deterministic Wait**: `Wait()` blocks until the routine is retired into history; `Wait(); GetRecord(id)` never races.
 - **Idle watchdog is opt-in**: only `WithIdleTimeout(d > 0)` enables it; on timeout the state becomes `TIMED_OUT` and `Wait()` returns `ErrIdleTimeout`.
 - **Supervision**: panics are recovered per attempt and treated as failures; backoff resets after a stable attempt; heartbeats continue during backoff.
 - **Bounded memory**: finished routines leave the active registry; history is a fixed-size ring.
 - **Busy metric**: `BusyPercent` reflects only explicit `AddBusy` instrumentation.
 - **Payload sizing**: If your channel payload implements `Sizer`, queue bytes are estimated; otherwise bytes may be `0`.
-- **Best-effort shutdown**: `KillAll()` cancels; `Shutdown(d)` waits up to `d` (total) for all routines to exit; repeated calls are safe.
+- **Best-effort shutdown**: `KillAll()` cancels; `Shutdown(d)` waits up to `d` (total) for all routines to exit, rejects new routines via `TryGo`/`ErrOrchestratorClosed`, and repeated calls are safe (a timed-out shutdown stays `CLOSING`).
+- **Blocked metrics**: `BlockedSendNs`/`BlockedRecvNs` measure only real waits; a cancelled context fails deterministically even with buffer space.
 - **Thread-safe**: Public orchestrator, bus and server methods are safe for concurrent use.
 - **No panics from the library**: worker panics are captured by the routine or the supervisor.
 
