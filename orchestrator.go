@@ -53,6 +53,21 @@ func WithHistoryLimit(n int) OrchestratorOption {
 	}
 }
 
+// WithTerminalCardinalityLimit bounds how many distinct (name, state)
+// terminal counters are tracked. Once the limit is reached, new
+// combinations are aggregated under OverflowRoutineName; existing
+// combinations keep counting normally. 0 (default) means unlimited.
+//
+// Routine names should be low-cardinality labels by contract.
+func WithTerminalCardinalityLimit(n int) OrchestratorOption {
+	return func(o *Orchestrator) {
+		if n < 0 {
+			n = 0
+		}
+		o.terminalLimit = n
+	}
+}
+
 type terminalKey struct {
 	name  string
 	state RoutineState
@@ -61,10 +76,11 @@ type terminalKey struct {
 type Orchestrator struct {
 	mu           sync.RWMutex
 	lifecycle    OrchestratorState
-	routines     map[uint64]*Routine // active routines only
-	history      historyRing         // bounded ring of finished routines
-	historyLimit int
-	terminal     map[terminalKey]uint64
+	routines      map[uint64]*Routine // active routines only
+	history       historyRing         // bounded ring of finished routines
+	historyLimit  int
+	terminal      map[terminalKey]uint64
+	terminalLimit int
 	wg           sync.WaitGroup
 	gen          internalutil.IDGen
 	clock        internalutil.Clock
@@ -151,7 +167,14 @@ func (o *Orchestrator) retire(r *Routine) {
 	o.mu.Lock()
 	delete(o.routines, r.id)
 	o.history.push(rec, o.historyLimit)
-	o.terminal[terminalKey{name: rec.Name, state: rec.State}]++
+
+	key := terminalKey{name: rec.Name, state: rec.State}
+	if o.terminalLimit > 0 && len(o.terminal) >= o.terminalLimit {
+		if _, exists := o.terminal[key]; !exists {
+			key.name = OverflowRoutineName
+		}
+	}
+	o.terminal[key]++
 	o.mu.Unlock()
 }
 

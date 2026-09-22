@@ -20,9 +20,20 @@ type RoutineRecord struct {
 	Err        string
 }
 
+// OverflowRoutineName is the bucket that terminal counters fall back to once
+// the configured terminal cardinality limit is reached (see
+// WithTerminalCardinalityLimit).
+const OverflowRoutineName = "__other__"
+
 // TerminalCount aggregates finished routines by name and final state.
 // Cardinality is bounded by the number of distinct routine names and states,
 // which makes it safe for Prometheus labels (unlike per-routine-ID labels).
+//
+// Contract: routine names are expected to be low-cardinality labels (e.g.
+// "price-feed", "order-worker"), not per-entity identifiers (e.g.
+// "order-918272"). High-cardinality names inflate both memory and Prometheus
+// series; use WithTerminalCardinalityLimit to cap the number of distinct
+// series and bucket the rest under OverflowRoutineName.
 type TerminalCount struct {
 	Name  string
 	State RoutineState

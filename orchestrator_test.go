@@ -89,6 +89,47 @@ func TestOrchestrator_HistoryDisabled(t *testing.T) {
 	}
 }
 
+func TestOrchestrator_TerminalCardinalityLimitBucketsOverflow(t *testing.T) {
+	o := New(WithTerminalCardinalityLimit(2))
+
+	for _, name := range []string{"a", "b", "c", "d", "a"} {
+		r := o.Go(func(ctx context.Context, self *Routine) error { return nil }, WithName(name))
+		if err := r.Wait(); err != nil {
+			t.Fatalf("wait: %v", err)
+		}
+	}
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	want := map[string]uint64{"a": 2, "b": 1, OverflowRoutineName: 2}
+	counts := o.TerminalCounts()
+	if len(counts) != len(want) {
+		t.Fatalf("expected %d terminal series, got %d: %+v", len(want), len(counts), counts)
+	}
+	for _, c := range counts {
+		if c.State != StateStopped {
+			t.Fatalf("unexpected state %s", c.State)
+		}
+		if want[c.Name] != c.Count {
+			t.Fatalf("name %q: expected %d, got %d", c.Name, want[c.Name], c.Count)
+		}
+	}
+}
+
+func TestOrchestrator_TerminalCardinalityUnlimitedByDefault(t *testing.T) {
+	o := New()
+	for _, name := range []string{"a", "b", "c", "d"} {
+		r := o.Go(func(ctx context.Context, self *Routine) error { return nil }, WithName(name))
+		_ = r.Wait()
+	}
+	_ = o.Shutdown(time.Second)
+
+	if got := len(o.TerminalCounts()); got != 4 {
+		t.Fatalf("expected 4 distinct series, got %d", got)
+	}
+}
+
 func TestOrchestrator_ShutdownTimeout(t *testing.T) {
 	o := New()
 	started := make(chan struct{})
