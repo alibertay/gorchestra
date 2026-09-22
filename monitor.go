@@ -18,18 +18,25 @@ const (
 )
 
 type Snapshot struct {
-	ID            uint64
-	Name          string
-	State         RoutineState
-	Health        Health
-	Uptime        time.Duration
-	IdleFor       time.Duration
-	ActivePercent float64 // estimated
-	QueueLen      int
-	QueueCap      int
-	QueueBytes    int64
-	Restarts      uint64
-	Err           string
+	ID      uint64
+	Name    string
+	State   RoutineState
+	Health  Health
+	Uptime  time.Duration
+	IdleFor time.Duration
+	// Busy is the time recorded via AddBusy (explicit instrumentation).
+	Busy time.Duration
+	// Blocked is the time the routine spent waiting on channel send/recv.
+	Blocked time.Duration
+	// BusyPercent is the observed busy ratio (Busy / Uptime). It only
+	// reflects what the caller instrumented with AddBusy; an uninstrumented
+	// worker reports 0, never a fabricated 100.
+	BusyPercent float64
+	QueueLen    int
+	QueueCap    int
+	QueueBytes  int64
+	Restarts    uint64
+	Err         string
 }
 
 func snapshotOf(r *Routine) Snapshot {
@@ -41,14 +48,11 @@ func snapshotOf(r *Routine) Snapshot {
 	last := time.Unix(0, r.lastBeatNs.Load())
 	idle := now.Sub(last)
 
-	// Active% ≈ (busy + (uptime - blocked)) / uptime
 	blocked := time.Duration(r.blockedNs.Load())
 	busy := time.Duration(r.busyNs.Load())
-	active := busy + (uptime - blocked)
-	if active < 0 {
-		active = 0
-	}
-	est := (float64(active) / float64(uptime)) * 100
+
+	// Observed busy ratio: strictly instrumentation based.
+	est := (float64(busy) / float64(uptime)) * 100
 	if est < 0 {
 		est = 0
 	}
@@ -77,30 +81,33 @@ func snapshotOf(r *Routine) Snapshot {
 	chst := r.mbox.Stats()
 
 	return Snapshot{
-		ID:            r.id,
-		Name:          r.name,
-		State:         state,
-		Health:        health,
-		Uptime:        uptime,
-		IdleFor:       idle,
-		ActivePercent: math.Round(est*10) / 10,
-		QueueLen:      chst.Len,
-		QueueCap:      chst.Cap,
-		QueueBytes:    chst.ApproxBytes,
-		Restarts:      r.Restarts(),
-		Err:           errStr,
+		ID:          r.id,
+		Name:        r.name,
+		State:       state,
+		Health:      health,
+		Uptime:      uptime,
+		IdleFor:     idle,
+		Busy:        busy,
+		Blocked:     blocked,
+		BusyPercent: math.Round(est*10) / 10,
+		QueueLen:    chst.Len,
+		QueueCap:    chst.Cap,
+		QueueBytes:  chst.ApproxBytes,
+		Restarts:    r.Restarts(),
+		Err:         errStr,
 	}
 }
 
 func (o *Orchestrator) PrintStats(w io.Writer) {
 	tw := tabwriter.NewWriter(w, 0, 8, 2, ' ', 0)
-	fmt.Fprintf(tw, "ID\tNAME\tSTATE\tHEALTH\tUPTIME\tIDLE\tACTIVE%%\tQ(LEN/CAP)\tQ(BYTES)\tRESTARTS\tERR\n")
+	fmt.Fprintf(tw, "ID\tNAME\tSTATE\tHEALTH\tUPTIME\tIDLE\tBUSY%%\tBUSY\tBLOCKED\tQ(LEN/CAP)\tQ(BYTES)\tRESTARTS\tERR\n")
 	for _, r := range o.List() {
 		s := snapshotOf(r)
 		fmt.Fprintf(
 			tw,
-			"%d\t%s\t%s\t%s\t%s\t%s\t%.1f\t%d/%d\t%d\t%d\t%s\n",
-			s.ID, nonEmpty(s.Name), s.State.String(), s.Health, dur(s.Uptime), dur(s.IdleFor), s.ActivePercent,
+			"%d\t%s\t%s\t%s\t%s\t%s\t%.1f\t%s\t%s\t%d/%d\t%d\t%d\t%s\n",
+			s.ID, nonEmpty(s.Name), s.State.String(), s.Health, dur(s.Uptime), dur(s.IdleFor), s.BusyPercent,
+			dur(s.Busy), dur(s.Blocked),
 			s.QueueLen, s.QueueCap, s.QueueBytes, s.Restarts, s.Err,
 		)
 	}
