@@ -36,23 +36,45 @@ func (c *Channel[T]) Send(ctx context.Context, v T) error {
 		}
 	}
 
+	// Deterministic cancellation: an already-cancelled context fails
+	// immediately, regardless of buffer space.
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	// Fast path: a send that does not need to wait is not "blocked", so no
+	// timing noise is recorded for high-throughput pipelines.
+	select {
+	case c.ch <- v:
+		c.sends.Add(1)
+		if sz := sizeOf(v); sz > 0 {
+			c.approxBytes.Add(int64(sz))
+		}
+		return nil
+	default:
+	}
+
+	// Slow path: the send actually had to wait; measure the real blocking
+	// time only.
 	start := time.Now()
 	select {
 	case c.ch <- v:
+		waited := time.Since(start)
+		c.blockedSendNanos.Add(waited.Nanoseconds())
+		addBlocked(ctx, waited)
+		c.sends.Add(1)
+		if sz := sizeOf(v); sz > 0 {
+			c.approxBytes.Add(int64(sz))
+		}
+		return nil
 	case <-ctx.Done():
 		waited := time.Since(start)
 		c.blockedSendNanos.Add(waited.Nanoseconds())
 		addBlocked(ctx, waited)
 		return ctx.Err()
 	}
-	waited := time.Since(start)
-	c.blockedSendNanos.Add(waited.Nanoseconds())
-	addBlocked(ctx, waited)
-	c.sends.Add(1)
-	if sz := sizeOf(v); sz > 0 {
-		c.approxBytes.Add(int64(sz))
-	}
-	return nil
 }
 
 func (c *Channel[T]) Recv(ctx context.Context) (T, error) {
@@ -66,6 +88,25 @@ func (c *Channel[T]) Recv(ctx context.Context) (T, error) {
 		}
 	}
 
+	// Deterministic cancellation (see Send).
+	select {
+	case <-ctx.Done():
+		return zero, ctx.Err()
+	default:
+	}
+
+	// Fast path: a value was already available; not blocked, no timing noise.
+	select {
+	case v := <-c.ch:
+		c.recvs.Add(1)
+		if sz := sizeOf(v); sz > 0 {
+			c.approxBytes.Add(-int64(sz))
+		}
+		return v, nil
+	default:
+	}
+
+	// Slow path: measure the real blocking time.
 	start := time.Now()
 	select {
 	case v := <-c.ch:
