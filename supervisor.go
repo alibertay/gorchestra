@@ -190,8 +190,10 @@ func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) 
 	}
 	// tek Routine içinde loop ederek supervise edelim
 	return o.Go(func(ctx context.Context, self *Routine) error {
+		defer self.setSupervisorState(SupervisorStopping)
 		bo := newBackoff(cfg)
 		for {
+			self.setSupervisorState(SupervisorRunning)
 			// her denemede yeni child-context
 			attemptStart := o.clock.Now()
 			childCtx, cancel := context.WithCancel(ctx)
@@ -222,6 +224,7 @@ func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) 
 
 			self.incrementRestarts()
 
+			self.setSupervisorState(SupervisorBackoff)
 			if !waitBackoff(ctx, self, bo.next(), cfg.Idle) {
 				return ctx.Err()
 			}

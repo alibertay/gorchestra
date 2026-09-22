@@ -173,6 +173,29 @@ func TestRoutine_WithIdleTimeout_ZeroAndNegativeDisable(t *testing.T) {
 	}
 }
 
+func TestRoutine_NonSupervisedHasNoSupervisorState(t *testing.T) {
+	o := New()
+	defer func() { _ = o.Shutdown(time.Second) }()
+
+	started := make(chan struct{})
+	r := o.Go(func(ctx context.Context, self *Routine) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	<-started
+
+	if got := r.SupervisorState(); got != SupervisorNone {
+		t.Fatalf("expected SupervisorNone, got %s", got)
+	}
+	if got := snapshotOf(r).SupervisorState; got != SupervisorNone {
+		t.Fatalf("snapshot expected SupervisorNone, got %s", got)
+	}
+	if got := o.PublicSnapshots()[0].SupervisorState; got != "" {
+		t.Fatalf("public snapshot must omit supervisor state for plain routines, got %q", got)
+	}
+}
+
 func TestRoutine_HeartbeatPreventsTimeout(t *testing.T) {
 	o := New()
 	defer func() { _ = o.Shutdown(time.Second) }()

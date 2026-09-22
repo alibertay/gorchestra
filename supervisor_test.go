@@ -248,6 +248,33 @@ func TestSupervisor_BackoffKeepsHeartbeatAlive(t *testing.T) {
 	_ = r.Wait()
 }
 
+func TestSupervisor_StateVisibility(t *testing.T) {
+	o := New()
+	defer func() { _ = o.Shutdown(time.Second) }()
+
+	var attempts atomic.Int32
+	r := o.GoSupervised(func(ctx context.Context, self *Routine) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("first failure")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}, WithSupBackoff(500*time.Millisecond, 500*time.Millisecond, 2.0, 0))
+
+	waitFor(t, 2*time.Second, "BACKOFF state", func() bool {
+		return r.SupervisorState() == SupervisorBackoff
+	})
+	waitFor(t, 2*time.Second, "RUNNING state", func() bool {
+		return r.SupervisorState() == SupervisorRunning
+	})
+
+	r.Kill()
+	_ = r.Wait()
+	if got := r.SupervisorState(); got != SupervisorStopping {
+		t.Fatalf("expected STOPPING after kill, got %s", got)
+	}
+}
+
 func TestSupervisor_RestartAlways(t *testing.T) {
 	o := New()
 	defer func() { _ = o.Shutdown(time.Second) }()

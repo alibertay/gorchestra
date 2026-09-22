@@ -24,6 +24,7 @@ type Collector struct {
 	restarts       *prometheus.Desc
 	busySeconds    *prometheus.Desc
 	blockedSeconds *prometheus.Desc
+	supervisor     *prometheus.Desc
 	terminals      *prometheus.Desc
 }
 
@@ -38,6 +39,7 @@ func NewPrometheusCollector(o *gorchestra.Orchestrator) *Collector {
 		restarts:       prometheus.NewDesc("gorchestra_restarts_total", "Total restarts since start", []string{"id", "name"}, nil),
 		busySeconds:    prometheus.NewDesc("gorchestra_routine_busy_seconds", "Instrumented busy time (AddBusy)", []string{"id", "name"}, nil),
 		blockedSeconds: prometheus.NewDesc("gorchestra_routine_blocked_seconds", "Time blocked on channels", []string{"id", "name"}, nil),
+		supervisor:     prometheus.NewDesc("gorchestra_supervisor_state", "Supervised routines by phase (RUNNING/BACKOFF/STOPPING), gauge=1", []string{"id", "name", "phase"}, nil),
 		terminals:      prometheus.NewDesc("gorchestra_routines_terminal_total", "Finished routines by name and final state", []string{"name", "state"}, nil),
 	}
 }
@@ -50,6 +52,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.restarts
 	ch <- c.busySeconds
 	ch <- c.blockedSeconds
+	ch <- c.supervisor
 	ch <- c.terminals
 }
 
@@ -72,6 +75,10 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			idStr(s.ID), s.Name)
 		ch <- prometheus.MustNewConstMetric(c.blockedSeconds, prometheus.GaugeValue, s.BlockedSec,
 			idStr(s.ID), s.Name)
+		if s.SupervisorState != "" {
+			ch <- prometheus.MustNewConstMetric(c.supervisor, prometheus.GaugeValue, 1,
+				idStr(s.ID), s.Name, s.SupervisorState)
+		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.activeRoutines, prometheus.GaugeValue, running)
 

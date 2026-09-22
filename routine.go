@@ -31,6 +31,32 @@ const (
 // because it stopped sending heartbeats while an idle timeout was configured.
 var ErrIdleTimeout = errors.New("gorchestra: idle timeout")
 
+// SupervisorState describes what a supervised routine is currently doing.
+// Routines started with Go (not GoSupervised) always report SupervisorNone.
+type SupervisorState int32
+
+const (
+	SupervisorNone SupervisorState = iota
+	SupervisorRunning
+	SupervisorBackoff
+	SupervisorStopping
+)
+
+func (s SupervisorState) String() string {
+	switch s {
+	case SupervisorNone:
+		return "NONE"
+	case SupervisorRunning:
+		return "RUNNING"
+	case SupervisorBackoff:
+		return "BACKOFF"
+	case SupervisorStopping:
+		return "STOPPING"
+	default:
+		return fmt.Sprintf("SUPERVISOR_STATE(%d)", int(s))
+	}
+}
+
 // Terminal reports whether the state is final. Terminal states never
 // transition to another state.
 func (s RoutineState) Terminal() bool {
@@ -95,6 +121,7 @@ type Routine struct {
 	busyNs    atomic.Int64 // kullanıcı enstrümantasyonuyla toplanan iş süresi
 
 	restarts atomic.Uint64
+	supState atomic.Int32 // SupervisorState (only meaningful for supervised routines)
 
 	doneOnce sync.Once
 	doneCh   chan struct{}
@@ -135,6 +162,16 @@ func (r *Routine) Beat()                    { r.lastBeatNs.Store(r.clock.Now().U
 // State returns the current lifecycle state. Terminal states
 // (STOPPED, TIMED_OUT, PANICKED) are final.
 func (r *Routine) State() RoutineState { return RoutineState(r.state.Load()) }
+
+// SupervisorState reports the supervised phase of the routine: RUNNING,
+// BACKOFF or STOPPING. It is SupervisorNone for routines started with Go.
+func (r *Routine) SupervisorState() SupervisorState {
+	return SupervisorState(r.supState.Load())
+}
+
+func (r *Routine) setSupervisorState(s SupervisorState) {
+	r.supState.Store(int32(s))
+}
 
 // Kill requests cancellation. It is a no-op on terminal routines: a routine
 // that already finished (or timed out / panicked) keeps its final state.

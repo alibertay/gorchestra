@@ -32,11 +32,14 @@ type Snapshot struct {
 	// reflects what the caller instrumented with AddBusy; an uninstrumented
 	// worker reports 0, never a fabricated 100.
 	BusyPercent float64
-	QueueLen    int
-	QueueCap    int
-	QueueBytes  int64
-	Restarts    uint64
-	Err         string
+	// SupervisorState is RUNNING/BACKOFF/STOPPING for supervised routines
+	// and SupervisorNone otherwise.
+	SupervisorState SupervisorState
+	QueueLen        int
+	QueueCap        int
+	QueueBytes      int64
+	Restarts        uint64
+	Err             string
 }
 
 func snapshotOf(r *Routine) Snapshot {
@@ -81,20 +84,21 @@ func snapshotOf(r *Routine) Snapshot {
 	chst := r.mbox.Stats()
 
 	return Snapshot{
-		ID:          r.id,
-		Name:        r.name,
-		State:       state,
-		Health:      health,
-		Uptime:      uptime,
-		IdleFor:     idle,
-		Busy:        busy,
-		Blocked:     blocked,
-		BusyPercent: math.Round(est*10) / 10,
-		QueueLen:    chst.Len,
-		QueueCap:    chst.Cap,
-		QueueBytes:  chst.ApproxBytes,
-		Restarts:    r.Restarts(),
-		Err:         errStr,
+		ID:              r.id,
+		Name:            r.name,
+		State:           state,
+		Health:          health,
+		Uptime:          uptime,
+		IdleFor:         idle,
+		Busy:            busy,
+		Blocked:         blocked,
+		BusyPercent:     math.Round(est*10) / 10,
+		SupervisorState: r.SupervisorState(),
+		QueueLen:        chst.Len,
+		QueueCap:        chst.Cap,
+		QueueBytes:      chst.ApproxBytes,
+		Restarts:        r.Restarts(),
+		Err:             errStr,
 	}
 }
 

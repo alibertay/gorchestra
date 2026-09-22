@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -82,6 +84,44 @@ func TestCollector_TerminalTotalsAggregatedByNameAndState(t *testing.T) {
 	}
 	if got := m.GetCounter().GetValue(); got != n {
 		t.Fatalf("expected %d terminal routines, got %v", n, got)
+	}
+}
+
+func TestCollector_SupervisorStateSeries(t *testing.T) {
+	o := g.New()
+	var attempts atomic.Int32
+	r := o.GoSupervised(func(ctx context.Context, self *g.Routine) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("first failure")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}, g.WithSupBackoff(400*time.Millisecond, 400*time.Millisecond, 2.0, 0))
+	defer func() {
+		r.Kill()
+		_ = r.Wait()
+		_ = o.Shutdown(time.Second)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && r.SupervisorState() != g.SupervisorBackoff {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if r.SupervisorState() != g.SupervisorBackoff {
+		t.Fatal("supervisor never entered backoff")
+	}
+
+	families := gather(t, NewPrometheusCollector(o))
+	f := families["gorchestra_supervisor_state"]
+	if f == nil || len(f.GetMetric()) != 1 {
+		t.Fatalf("expected one supervisor state series, got %v", f)
+	}
+	labels := map[string]string{}
+	for _, l := range f.GetMetric()[0].GetLabel() {
+		labels[l.GetName()] = l.GetValue()
+	}
+	if labels["phase"] != "BACKOFF" {
+		t.Fatalf("expected phase=BACKOFF, got %v", labels)
 	}
 }
 
