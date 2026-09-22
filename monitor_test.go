@@ -6,6 +6,29 @@ import (
 	"time"
 )
 
+type fakeClock struct{ now time.Time }
+
+func (f *fakeClock) Now() time.Time                         { return f.now }
+func (f *fakeClock) Since(t time.Time) time.Duration        { return f.now.Sub(t) }
+func (f *fakeClock) NewTicker(d time.Duration) *time.Ticker { return time.NewTicker(d) }
+func (f *fakeClock) NewTimer(d time.Duration) *time.Timer   { return time.NewTimer(d) }
+func (f *fakeClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+
+func TestSnapshot_UsesInjectedClock(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(1000, 0)}
+	r := newRoutine(1, "fake", 0, 8, clk)
+
+	clk.now = clk.now.Add(2 * time.Second)
+
+	s := snapshotOf(r)
+	if s.Uptime != 2*time.Second {
+		t.Fatalf("expected 2s uptime from the injected clock, got %v", s.Uptime)
+	}
+	if s.IdleFor != 2*time.Second {
+		t.Fatalf("expected 2s idle from the injected clock, got %v", s.IdleFor)
+	}
+}
+
 func TestSnapshot_IdleWorkerReportsZeroBusy(t *testing.T) {
 	o := New()
 	defer func() { _ = o.Shutdown(time.Second) }()

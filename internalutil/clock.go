@@ -7,6 +7,7 @@ type Clock interface {
 	Now() time.Time
 	Since(t time.Time) time.Duration
 	NewTicker(d time.Duration) *time.Ticker
+	NewTimer(d time.Duration) *time.Timer
 	After(d time.Duration) <-chan time.Time
 }
 
@@ -15,4 +16,5 @@ type RealClock struct{}
 func (RealClock) Now() time.Time                         { return time.Now() }
 func (RealClock) Since(t time.Time) time.Duration        { return time.Since(t) }
 func (RealClock) NewTicker(d time.Duration) *time.Ticker { return time.NewTicker(d) }
+func (RealClock) NewTimer(d time.Duration) *time.Timer   { return time.NewTimer(d) }
 func (RealClock) After(d time.Duration) <-chan time.Time { return time.After(d) }

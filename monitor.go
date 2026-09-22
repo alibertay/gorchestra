@@ -43,7 +43,9 @@ type Snapshot struct {
 }
 
 func snapshotOf(r *Routine) Snapshot {
-	now := time.Now()
+	// Use the routine's injected clock so uptime/idle calculations share the
+	// same time source as the heartbeat and idle watchdog.
+	now := r.clock.Now()
 	uptime := now.Sub(r.createdAt)
 	if uptime < time.Nanosecond {
 		uptime = time.Nanosecond

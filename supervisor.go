@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"time"
+
+	"github.com/alibertay/gorchestra/internalutil"
 )
 
 type RestartPolicy int
@@ -149,8 +151,10 @@ func runAttempt(fn func(ctx context.Context, self *Routine) error, ctx context.C
 
 // waitBackoff waits out a backoff delay while keeping the heartbeat alive, so
 // a supervised routine with an idle timeout is not mistaken for a dead one
-// while it is merely waiting to restart. Returns false if ctx was cancelled.
-func waitBackoff(ctx context.Context, self *Routine, d time.Duration, idle time.Duration) bool {
+// while it is merely waiting to restart. It uses the injected clock so the
+// whole supervisor path shares one time source. Returns false if ctx was
+// cancelled.
+func waitBackoff(ctx context.Context, self *Routine, clock internalutil.Clock, d time.Duration, idle time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
@@ -162,9 +166,9 @@ func waitBackoff(ctx context.Context, self *Routine, d time.Duration, idle time.
 		beat = time.Millisecond
 	}
 
-	timer := time.NewTimer(d)
+	timer := clock.NewTimer(d)
 	defer timer.Stop()
-	ticker := time.NewTicker(beat)
+	ticker := clock.NewTicker(beat)
 	defer ticker.Stop()
 
 	self.Beat()
@@ -225,7 +229,7 @@ func (o *Orchestrator) GoSupervised(fn func(ctx context.Context, self *Routine) 
 			self.incrementRestarts()
 
 			self.setSupervisorState(SupervisorBackoff)
-			if !waitBackoff(ctx, self, bo.next(), cfg.Idle) {
+			if !waitBackoff(ctx, self, o.clock, bo.next(), cfg.Idle) {
 				return ctx.Err()
 			}
 		}
