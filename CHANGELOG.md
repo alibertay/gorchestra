@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-22
+
+Verification follow-up release: one lifecycle consistency fix plus
+documentation, clock consistency and fuzz automation.
+
+### Added
+
+- `FuzzLifecyclePublicAPI`: lifecycle fuzzing through exported API only
+  (`Go`/`TryGo`/`Kill`/`Wait`/`Beat`/`State`/`SupervisorState`/`Shutdown`).
+- Scheduled fuzz workflow (`.github/workflows/fuzz.yml`): both fuzz targets
+  run weekly on a cron and on manual dispatch.
+
+### Fixed
+
+- A routine rejected by `TryGo` after shutdown now has its context
+  cancelled, matching the terminal-state guarantee of finished routines
+  (previously `State() == STOPPED` while `Context().Done()` stayed open).
+
+### Changed
+
+- Snapshots (`snapshotOf`) and supervisor backoff waits use the injected
+  clock; `internalutil.Clock` gained `NewTimer`. A fake-clock test proves
+  uptime/idle come from the injected time source.
+- Documentation: `WithTerminalCardinalityLimit(n)` semantics clarified — it
+  limits individually tracked `(name, state)` combinations; overflow names
+  are aggregated into per-state `__other__` buckets, so total series can be
+  up to n + one bucket per overflowing state.
+
 ## [0.3.0] - 2026-09-22
 
 Lifecycle hardening release (second technical review): orchestrator close
@@ -128,7 +156,8 @@ restart policies and exponential backoff, typed `Channel[T]`/`Bus[T]`,
 observability server (metrics, dashboard, pprof, healthz) and a Prometheus
 collector.
 
-[Unreleased]: https://github.com/alibertay/gorchestra/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/alibertay/gorchestra/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/alibertay/gorchestra/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/alibertay/gorchestra/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/alibertay/gorchestra/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/alibertay/gorchestra/releases/tag/v0.1.0

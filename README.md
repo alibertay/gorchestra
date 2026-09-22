@@ -282,8 +282,8 @@ Cardinality strategy:
 
 - per-routine series (`id` label) exist **only while the routine is active**
 - finished routines are aggregated into `gorchestra_routines_terminal_total{name,state}`, bounded by worker names — not by routine IDs
-- **routine names are expected to be low-cardinality labels** (`price-feed`, not `order-918272`); `WithTerminalCardinalityLimit(n)` caps distinct terminal series and buckets overflow under `OverflowRoutineName` (`__other__`)
-- supervised routines additionally export `gorchestra_supervisor_state{id,name,phase}`
+- **routine names are expected to be low-cardinality labels** (`price-feed`, not `order-918272`); `WithTerminalCardinalityLimit(n)` limits individually tracked `(name, state)` counters and aggregates further names into per-state `OverflowRoutineName` (`__other__`) buckets (the state dimension is preserved; total series ≤ n + one bucket per overflowing state)
+- supervised routines additionally export `gorchestra_supervisor_state{id,name,phase}`; those series disappear when the routine ends, so their cardinality tracks active concurrency, never history
 
 ---
 
@@ -303,7 +303,8 @@ func New(opts ...OrchestratorOption) *Orchestrator
 
 // Bound the finished-routine history ring (0 disables it; default 1000)
 func WithHistoryLimit(n int) OrchestratorOption
-// Cap distinct terminal (name,state) series; overflow -> OverflowRoutineName.
+// Limit individually tracked (name,state) terminal counters; further names
+// are aggregated into per-state OverflowRoutineName buckets.
 // 0 = unlimited (default). Routine names should be low-cardinality.
 func WithTerminalCardinalityLimit(n int) OrchestratorOption
 
@@ -496,7 +497,10 @@ The repo integrates `go.uber.org/goleak` in the core and `obs` packages to ensur
 go test ./...
 go test -race ./...
 go test -fuzz=FuzzRoutineStateTransitions -fuzztime=30s .
+go test -fuzz=FuzzLifecyclePublicAPI -fuzztime=30s .
 ```
+
+CI runs the race-enabled suite on every push/PR and both fuzz targets on a weekly schedule (plus manual dispatch).
 
 Covered behaviors include: normal completion, `Kill`, idle timeout, panic, terminal-state stability, orchestrator lifecycle (`TryGo` vs `Shutdown` races), supervised error/panic restarts, `RestartNever`/`RestartAlways`, backoff reset/cap/jitter, concurrent `Bus.Topic`, concurrent channel send/recv, shutdown timeout, repeated `Shutdown`/`Stop`, bounded history, metric cardinality, plus stress scenarios (10k routines, rapid create/destroy, restart storms, high topic throughput).
 
