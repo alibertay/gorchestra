@@ -2,6 +2,7 @@ package gorchestra
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -10,6 +11,33 @@ import (
 )
 
 const defaultHistoryLimit = 1000
+
+// ErrOrchestratorClosed is returned by TryGo (and surfaced by the Wait of a
+// routine returned by Go) when the orchestrator has begun shutting down and
+// no longer accepts new routines.
+var ErrOrchestratorClosed = errors.New("gorchestra: orchestrator is closed")
+
+// OrchestratorState describes the lifecycle of an Orchestrator.
+type OrchestratorState int32
+
+const (
+	OrchestratorOpen OrchestratorState = iota
+	OrchestratorClosing
+	OrchestratorClosed
+)
+
+func (s OrchestratorState) String() string {
+	switch s {
+	case OrchestratorOpen:
+		return "OPEN"
+	case OrchestratorClosing:
+		return "CLOSING"
+	case OrchestratorClosed:
+		return "CLOSED"
+	default:
+		return fmt.Sprintf("ORCHESTRATOR_STATE(%d)", int(s))
+	}
+}
 
 // OrchestratorOption configures an Orchestrator.
 type OrchestratorOption func(*Orchestrator)
@@ -32,6 +60,7 @@ type terminalKey struct {
 
 type Orchestrator struct {
 	mu           sync.RWMutex
+	lifecycle    OrchestratorState
 	routines     map[uint64]*Routine // active routines only
 	history      historyRing         // bounded ring of finished routines
 	historyLimit int
@@ -54,7 +83,20 @@ func New(opts ...OrchestratorOption) *Orchestrator {
 	return o
 }
 
-func (o *Orchestrator) Go(fn func(ctx context.Context, self *Routine) error, opts ...RoutineOption) *Routine {
+// State returns the orchestrator lifecycle state. Once Shutdown begins the
+// state moves to CLOSING and no new routines are accepted; after all
+// routines have drained it becomes CLOSED.
+func (o *Orchestrator) State() OrchestratorState {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.lifecycle
+}
+
+// TryGo is like Go but reports an error when the orchestrator is shutting
+// down. On rejection it returns a routine that is already finished
+// (STOPPED) and whose Wait returns ErrOrchestratorClosed, so callers that
+// ignore the error still get a safe handle.
+func (o *Orchestrator) TryGo(fn func(ctx context.Context, self *Routine) error, opts ...RoutineOption) (*Routine, error) {
 	cfg := defaultRoutineOptions()
 	for _, opt := range opts {
 		opt(&cfg)
@@ -63,16 +105,29 @@ func (o *Orchestrator) Go(fn func(ctx context.Context, self *Routine) error, opt
 	r := newRoutine(id, cfg.Name, cfg.IdleTimeout, cfg.QueueCap, o.clock)
 
 	o.mu.Lock()
+	if o.lifecycle != OrchestratorOpen {
+		o.mu.Unlock()
+		r.finish(StateStopped, ErrOrchestratorClosed)
+		return r, ErrOrchestratorClosed
+	}
 	o.routines[id] = r
+	o.wg.Add(1) // registered before Wait can run: no Add after Wait
 	o.mu.Unlock()
 
-	o.wg.Add(1)
 	go func() {
 		defer o.wg.Done()
 		r.run(fn)
 		o.retire(r)
 	}()
 
+	return r, nil
+}
+
+// Go starts a managed routine. If the orchestrator is already shutting down
+// the returned routine is finished and its Wait returns
+// ErrOrchestratorClosed; use TryGo to handle that case explicitly.
+func (o *Orchestrator) Go(fn func(ctx context.Context, self *Routine) error, opts ...RoutineOption) *Routine {
+	r, _ := o.TryGo(fn, opts...)
 	return r
 }
 
@@ -155,9 +210,22 @@ func (o *Orchestrator) KillAll() {
 	}
 }
 
+// beginShutdown moves OPEN -> CLOSING. It is idempotent and does not wait.
+func (o *Orchestrator) beginShutdown() {
+	o.mu.Lock()
+	if o.lifecycle == OrchestratorOpen {
+		o.lifecycle = OrchestratorClosing
+	}
+	o.mu.Unlock()
+}
+
 // Shutdown gracefully stops all routines, waiting up to d in total
-// (best-effort). It is safe to call multiple times.
+// (best-effort). It is safe to call multiple times. Once called, the
+// orchestrator stops accepting new routines (TryGo returns
+// ErrOrchestratorClosed). If the drain times out the state stays CLOSING
+// and a later Shutdown can complete it.
 func (o *Orchestrator) Shutdown(d time.Duration) error {
+	o.beginShutdown()
 	o.KillAll()
 
 	done := make(chan struct{})
@@ -169,6 +237,7 @@ func (o *Orchestrator) Shutdown(d time.Duration) error {
 	if d <= 0 {
 		select {
 		case <-done:
+			o.markClosed()
 			return nil
 		default:
 			return fmt.Errorf("shutdown timed out after %v", d)
@@ -179,8 +248,17 @@ func (o *Orchestrator) Shutdown(d time.Duration) error {
 	defer t.Stop()
 	select {
 	case <-done:
+		o.markClosed()
 		return nil
 	case <-t.C:
 		return fmt.Errorf("shutdown timed out after %v", d)
 	}
+}
+
+func (o *Orchestrator) markClosed() {
+	o.mu.Lock()
+	if o.lifecycle == OrchestratorClosing {
+		o.lifecycle = OrchestratorClosed
+	}
+	o.mu.Unlock()
 }

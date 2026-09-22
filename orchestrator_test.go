@@ -2,7 +2,9 @@ package gorchestra
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -126,6 +128,141 @@ func TestOrchestrator_MultipleShutdown(t *testing.T) {
 	}
 	if got := r.State(); got != StateStopped {
 		t.Fatalf("expected STOPPED, got %s", got)
+	}
+}
+
+func TestOrchestrator_LifecycleStates(t *testing.T) {
+	o := New()
+	if got := o.State(); got != OrchestratorOpen {
+		t.Fatalf("expected OPEN, got %s", got)
+	}
+
+	if _, err := o.TryGo(func(ctx context.Context, self *Routine) error { return nil }); err != nil {
+		t.Fatalf("TryGo on an open orchestrator: %v", err)
+	}
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if got := o.State(); got != OrchestratorClosed {
+		t.Fatalf("expected CLOSED, got %s", got)
+	}
+}
+
+func TestOrchestrator_TryGoAfterShutdownRejected(t *testing.T) {
+	o := New()
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	r, err := o.TryGo(func(ctx context.Context, self *Routine) error { return nil })
+	if !errors.Is(err, ErrOrchestratorClosed) {
+		t.Fatalf("expected ErrOrchestratorClosed, got %v", err)
+	}
+	if r == nil {
+		t.Fatal("rejection must still return a safe routine handle")
+	}
+	if got := r.State(); got != StateStopped {
+		t.Fatalf("rejected routine must be STOPPED, got %s", got)
+	}
+	if werr := r.Wait(); !errors.Is(werr, ErrOrchestratorClosed) {
+		t.Fatalf("Wait must surface ErrOrchestratorClosed, got %v", werr)
+	}
+}
+
+func TestOrchestrator_GoAfterShutdownDoesNotRun(t *testing.T) {
+	o := New()
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	var called atomic.Bool
+	r := o.Go(func(ctx context.Context, self *Routine) error {
+		called.Store(true)
+		return nil
+	})
+	if called.Load() {
+		t.Fatal("worker must not run after shutdown")
+	}
+	if err := r.Wait(); !errors.Is(err, ErrOrchestratorClosed) {
+		t.Fatalf("expected ErrOrchestratorClosed from Wait, got %v", err)
+	}
+}
+
+func TestOrchestrator_ShutdownTimeoutStaysClosing(t *testing.T) {
+	o := New()
+	started := make(chan struct{})
+	r := o.Go(func(ctx context.Context, self *Routine) error {
+		close(started)
+		time.Sleep(200 * time.Millisecond)
+		return nil
+	})
+	<-started
+
+	if err := o.Shutdown(20 * time.Millisecond); err == nil {
+		t.Fatal("expected a shutdown timeout error")
+	}
+	if got := o.State(); got != OrchestratorClosing {
+		t.Fatalf("expected CLOSING after a timed-out shutdown, got %s", got)
+	}
+	if _, err := o.TryGo(func(ctx context.Context, self *Routine) error { return nil }); !errors.Is(err, ErrOrchestratorClosed) {
+		t.Fatalf("CLOSING orchestrator must reject new routines, got %v", err)
+	}
+
+	if err := r.Wait(); err != nil {
+		t.Fatalf("worker should complete naturally, got %v", err)
+	}
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("second shutdown should complete: %v", err)
+	}
+	if got := o.State(); got != OrchestratorClosed {
+		t.Fatalf("expected CLOSED, got %s", got)
+	}
+}
+
+func TestOrchestrator_ConcurrentTryGoAndShutdown(t *testing.T) {
+	o := New()
+	const workers = 64
+
+	var accepted atomic.Int64
+	var readyOnce sync.Once
+	ready := make(chan struct{})
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r, err := o.TryGo(func(ctx context.Context, self *Routine) error { return nil })
+			if err != nil {
+				return
+			}
+			accepted.Add(1)
+			readyOnce.Do(func() { close(ready) })
+			_ = r.Wait()
+		}()
+	}
+	close(start)
+
+	// Shutdown starts while the remaining TryGo calls are still in flight.
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("no routine was accepted before shutdown")
+	}
+	if err := o.Shutdown(2 * time.Second); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	wg.Wait()
+
+	if accepted.Load() == 0 {
+		t.Fatal("expected at least some routines to be accepted before shutdown")
+	}
+	if err := o.Shutdown(time.Second); err != nil {
+		t.Fatalf("final shutdown: %v", err)
+	}
+	if got := o.State(); got != OrchestratorClosed {
+		t.Fatalf("expected CLOSED, got %s", got)
 	}
 }
 
